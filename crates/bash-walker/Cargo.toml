@@ -14,15 +14,21 @@ workspace = true
 # across separate tool-call invocations is kept in a small state file on
 # disk (each invocation is a fresh process, injected via `docker exec` the
 # same way tool-sea's SEA is today — nothing survives in memory between
-# calls). Pipeline/redirect/cancellation discipline is adapted from
-# ~/repos/@shellicar/tower/mvp/crates/bridge/src/exec.rs, which already
-# implements and tests this exact design for the structured Exec tool.
+# calls). Pipeline discipline is adapted from
+# ~/repos/@shellicar/tower/mvp/crates/bridge/src/exec.rs; unlike tower's
+# interactive Exec there is no cancellation channel (the harness kills the
+# docker exec, the container owns child lifetimes), so this is synchronous
+# std::process — no tokio. Output capture is one shared append-mode file
+# (stdout+stderr of every child), which removes the drain-task/deadlock
+# surface entirely.
 [dependencies]
 bash-parser = { path = "../bash-parser" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+thiserror.workspace = true
+glob.workspace = true
+regex.workspace = true
 libc.workspace = true
 
 [[bin]]

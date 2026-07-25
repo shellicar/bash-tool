@@ -224,15 +224,12 @@ impl<'a> Lexer<'a> {
                 Some(b'`') => {
                     text.push_str(&self.scan_matched(b'`', b'`', "backtick substitution")?);
                 }
-                Some(b'$') if self.peek_at(1) == Some(b'(') && self.peek_at(2) == Some(b'(') => {
-                    self.pos += 2; // consume "$("
-                    text.push('$');
-                    text.push_str(&self.scan_matched(b'(', b')', "arithmetic expansion $((...))")?);
-                    // closes only the inner `)`; consume the matching outer one too
-                    if self.peek() == Some(b')') {
-                        text.push(self.bump().unwrap() as char);
-                    }
-                }
+                // `$((...))` needs no special case: the depth counter takes
+                // the whole balanced span, and arithmetic-vs-command-
+                // substitution is the EXPANDER's decision (bash's own
+                // tie-break), not the lexer's. A previous special arm here
+                // dropped the first `(` and silently corrupted `$((x+1))`
+                // into `$(x+1))` — found by a walker end-to-end test.
                 Some(b'$') if self.peek_at(1) == Some(b'(') => {
                     self.pos += 1; // consume "$"
                     text.push('$');
