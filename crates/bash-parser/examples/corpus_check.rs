@@ -12,6 +12,7 @@ fn main() {
     let mut unsupported: HashMap<String, usize> = HashMap::new();
     let mut other_errors = 0;
     let mut error_samples = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
 
     for cmd in &commands {
         match bash_parser::parse(cmd) {
@@ -24,6 +25,7 @@ fn main() {
                 if error_samples.len() < 15 {
                     error_samples.push((cmd.chars().take(120).collect::<String>(), e.to_string()));
                 }
+                failures.push(cmd.clone());
             }
         }
     }
@@ -41,4 +43,10 @@ fn main() {
         println!("  CMD: {cmd:?}");
         println!("  ERR: {err}");
     }
+    std::fs::write(
+        "/tmp/corpus_check_failures.json",
+        serde_json::to_string_pretty(&failures).unwrap(),
+    )
+    .unwrap();
+    println!("full failing commands written to /tmp/corpus_check_failures.json");
 }

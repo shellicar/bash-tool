@@ -28,6 +28,9 @@ fn write_redirect(out: &mut String, r: &Redirect, depth: usize) {
         RedirectOp::Append => ">>",
         RedirectOp::In => "<",
         RedirectOp::DupOut => ">&",
+        RedirectOp::DupIn => "<&",
+        RedirectOp::OutErr => "&>",
+        RedirectOp::AppendOutErr => "&>>",
         RedirectOp::Heredoc => "<<",
         RedirectOp::HeredocStrip => "<<-",
         RedirectOp::HereString => "<<<",
@@ -100,6 +103,24 @@ fn write_command(out: &mut String, cmd: &Command, depth: usize) {
             out.push_str("invert (!)\n");
             write_command(out, inner, depth + 1);
         }
+        Command::Time(inner) => {
+            indent(out, depth);
+            out.push_str("time\n");
+            write_command(out, inner, depth + 1);
+        }
+        Command::Background(inner) => {
+            indent(out, depth);
+            out.push_str("background (&)\n");
+            write_command(out, inner, depth + 1);
+        }
+        Command::Redirected { command, redirects } => {
+            indent(out, depth);
+            out.push_str("redirected\n");
+            write_command(out, command, depth + 1);
+            for r in redirects {
+                write_redirect(out, r, depth + 1);
+            }
+        }
         Command::Subshell(inner) => {
             indent(out, depth);
             out.push_str("subshell ( )\n");
@@ -112,8 +133,25 @@ fn write_command(out: &mut String, cmd: &Command, depth: usize) {
         }
         Command::For(f) => {
             indent(out, depth);
-            let _ = writeln!(out, "for {}", f.var);
+            let _ = write!(out, "for {}", f.var);
+            if !f.words.is_empty() {
+                out.push_str(" in");
+                for w in &f.words {
+                    out.push(' ');
+                    write_word(out, w);
+                }
+            }
+            out.push('\n');
             write_command(out, &f.body, depth + 1);
+        }
+        Command::ArithFor { expr, body } => {
+            indent(out, depth);
+            let _ = writeln!(out, "arith-for {expr:?}");
+            write_command(out, body, depth + 1);
+        }
+        Command::Arith { expr } => {
+            indent(out, depth);
+            let _ = writeln!(out, "arith {expr:?}");
         }
         Command::If(i) => {
             indent(out, depth);

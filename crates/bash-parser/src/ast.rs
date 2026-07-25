@@ -27,17 +27,19 @@ pub enum Connector {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirectOp {
-    // The common corpus-scoped forms (docs/ast-execution.md feature-prevalence
-    // table). Bash's real grammar has 19 r_instruction variants; the rare ones
-    // (`<>`, `&>>`, NUMBER-prefixed fd-dup forms beyond `2>&1`) are not yet
-    // represented here.
-    Out,      // >
-    Append,   // >>
-    In,       // <
-    DupOut,   // >&N or N>&M
-    Heredoc,  // <<
+    // The corpus-scoped forms (docs/ast-execution.md feature-prevalence
+    // table). Bash's real grammar has 19 r_instruction variants; still
+    // unrepresented: `<>`, `{fd}>file` REDIR_WORD forms.
+    Out,          // >
+    Append,       // >>
+    In,           // <
+    DupOut,       // >&N or N>&M
+    DupIn,        // <&N
+    OutErr,       // &>   (stdout+stderr to file)
+    AppendOutErr, // &>>
+    Heredoc,      // <<
     HeredocStrip, // <<-
-    HereString, // <<<
+    HereString,   // <<<
 }
 
 #[derive(Debug, Clone)]
@@ -98,8 +100,7 @@ pub enum CondExpr {
 #[derive(Debug, Clone)]
 pub struct ForCommand {
     pub var: String,
-    /// `None` means the C-style `for ((...))` arithmetic form (not yet
-    /// represented distinctly — treated as a plain word-list for now).
+    /// Empty means the `for x; do` form — bash iterates over `"$@"`.
     pub words: Vec<Word>,
     pub body: Box<Command>,
 }
@@ -138,19 +139,37 @@ pub struct CaseCommand {
 pub enum Command {
     Simple(SimpleCommand),
     Connection(Connection),
-    /// `!` inversion or `time` wrap around any command — bash represents
-    /// this as flags on the wrapped command's node (`CMD_INVERT_RETURN`,
-    /// `CMD_TIME_PIPELINE`), not a new node kind; mirrored here as an
-    /// explicit wrapper for now since Rust doesn't have bash's shared-flags-
-    /// field-on-every-variant shape without a lot of boilerplate.
+    /// `!` inversion — bash represents this as `CMD_INVERT_RETURN` flag on
+    /// the wrapped node, not a new node kind; mirrored as an explicit
+    /// wrapper since Rust doesn't have bash's shared-flags-field-on-every-
+    /// variant shape without a lot of boilerplate.
     Invert(Box<Command>),
+    /// `time [pipeline]` — bash's `CMD_TIME_PIPELINE` flag, same wrapper
+    /// treatment as `Invert`.
+    Time(Box<Command>),
+    /// A trailing `&` with nothing after it: `sleep 5 &`. `a & b` stays a
+    /// `Connection` with `Connector::SeqAsync` (bash: connection node with
+    /// a null right child; here a distinct wrapper).
+    Background(Box<Command>),
+    /// Redirects after a compound command's closer: `{ cmds; } > file`,
+    /// `done < input`. Bash threads a `redirects` list through every
+    /// COMMAND variant; a single wrapper node is semantically identical
+    /// (the redirects apply to the whole wrapped command) without the
+    /// per-variant boilerplate.
+    Redirected { command: Box<Command>, redirects: Vec<Redirect> },
     Subshell(Box<Command>),
     Group(Box<Command>), // { ...; }
     For(ForCommand),
+    /// C-style `for ((init; cond; step))` — the `((...))` span kept opaque,
+    /// same deferred treatment as every other arithmetic context.
+    ArithFor { expr: String, body: Box<Command> },
     If(IfCommand),
     Case(CaseCommand),
     While { cond: Box<Command>, body: Box<Command> },
     Until { cond: Box<Command>, body: Box<Command> },
     Cond(CondExpr), // [[ ... ]]
+    /// `((...))` arithmetic command in command position; interior opaque
+    /// until evaluation, exactly like `$((...))`.
+    Arith { expr: String },
     FunctionDef { name: String, body: Box<Command> },
 }

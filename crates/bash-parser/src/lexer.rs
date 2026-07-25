@@ -1,10 +1,17 @@
 //! Word/operator tokenizer. Quote- and bracket-aware: `$(...)`, `` `...` ``,
-//! `${...}`, `((...))`, and single/double-quoted spans are captured as one
-//! opaque token each — this IS `parse_matched_pair()`'s job
+//! `${...}`, `((...))`, `<(...)`/`>(...)`, and single/double-quoted spans are
+//! captured as one opaque token each — this IS `parse_matched_pair()`'s job
 //! (docs/ast-execution.md), just not yet split into its own reusable scanner
 //! module. Deliberately does NOT expand or interpret what's inside those
 //! spans; the resulting `Word.text` still contains the literal bracket
 //! characters, exactly like bash's own `WORD` token.
+//!
+//! `{`/`}` are NOT operator tokens. Bash treats them as reserved words —
+//! special only when standing alone in command position (`{ cmds; }`) — so
+//! `find -exec rm {} \;`'s `{}` must stay an ordinary word (a real corpus
+//! failure before this). The parser recognizes the standalone words instead.
+
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -15,22 +22,31 @@ pub enum Token {
     /// the AST printer: `2>&1` was silently splitting into a bogus `"2"`
     /// argument plus an fd-less `>&1` redirect before this existed).
     Fd(u32),
-    And,                // &&
-    Or,                 // ||
-    Pipe,               // |
-    Semi,               // ;
-    Amp,                // &
-    Great,              // >
-    DGreat,             // >>
-    Less,               // <
-    DLess,              // <<
-    DLessDash,          // <<-
-    DLessLess,          // <<<
-    GreatAmp,           // >&  or N>&M forms folded in as plain words upstream for now
+    /// A `((...))` arithmetic-command span, delimiters included, interior
+    /// opaque — the same deferred treatment as `$((...))`. Only emitted when
+    /// the balanced span really ends in `))`; `((echo a); echo b)` falls back
+    /// to nested subshells, mirroring how bash itself disambiguates.
+    Arith(String),
+    And,      // &&
+    Or,       // ||
+    Pipe,     // |
+    Semi,     // ;
+    DSemi,    // ;;   (case arm terminator)
+    SemiAmp,  // ;&   (case fallthrough)
+    DSemiAmp, // ;;&  (case test-next)
+    Amp,      // &
+    Great,     // >
+    DGreat,    // >>
+    Less,      // <
+    DLess,     // <<
+    DLessDash, // <<-
+    DLessLess, // <<<
+    GreatAmp,  // >&
+    LessAmp,   // <&
+    AmpGreat,  // &>
+    AmpDGreat, // &>>
     LParen,
     RParen,
-    LBrace,
-    RBrace,
     Newline,
     Eof,
 }
@@ -38,6 +54,14 @@ pub enum Token {
 pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
+    /// Heredocs seen on the current line, awaiting their bodies. Bash defers
+    /// body capture until the newline that ends the line the `<<` appeared
+    /// on — tokens after the delimiter word (`cat <<EOF | grep x`) belong to
+    /// the command, not the body. The parser registers each delimiter here;
+    /// `next_token` captures all pending bodies, in order, when it consumes
+    /// that newline (or hits EOF).
+    pending_heredocs: Vec<(String, bool)>,
+    bodies: VecDeque<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,7 +74,18 @@ pub enum LexError {
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
-        Self { src: src.as_bytes(), pos: 0 }
+        Self { src: src.as_bytes(), pos: 0, pending_heredocs: Vec::new(), bodies: VecDeque::new() }
+    }
+
+    pub fn register_heredoc(&mut self, delimiter: String, strip_tabs: bool) {
+        self.pending_heredocs.push((delimiter, strip_tabs));
+    }
+
+    /// Captured heredoc bodies, in source order. The parser matches them
+    /// back to `Redirect` nodes after the parse (an in-order AST walk visits
+    /// heredoc redirects in source order).
+    pub fn take_bodies(&mut self) -> VecDeque<String> {
+        std::mem::take(&mut self.bodies)
     }
 
     fn peek(&self) -> Option<u8> {
@@ -103,6 +138,14 @@ impl<'a> Lexer<'a> {
                         out.push(c);
                     }
                 }
+                // Quoted spans inside the bracket: a `)` inside `"..."` must
+                // not close `$(...)` — bash's parse_matched_pair tracks quote
+                // state (`qc`) for exactly this. Found live: a corpus
+                // `$(git log -S "...)...")` span ended early at the quoted `)`.
+                Some(c @ (b'\'' | b'"')) if c != close => {
+                    let quoted = self.scan_quoted(c)?;
+                    out.extend_from_slice(quoted.as_bytes());
+                }
                 Some(c) if open != close && c == open => {
                     depth += 1;
                     out.push(self.bump().unwrap());
@@ -131,6 +174,27 @@ impl<'a> Lexer<'a> {
                         out.push(c);
                     }
                 }
+                // Substitutions stay ACTIVE inside double quotes — a `"`
+                // inside `"$(date "+%Y")"`'s inner span must not close the
+                // outer quote, and an unterminated `${`/backtick inside
+                // double quotes is a syntax error in bash, not literal text.
+                // Mutual recursion with scan_matched gives the full nesting.
+                Some(b'$') if quote == b'"' && self.peek_at(1) == Some(b'(') => {
+                    self.pos += 1;
+                    out.push(b'$');
+                    let span = self.scan_matched(b'(', b')', "command substitution $(...)")?;
+                    out.extend_from_slice(span.as_bytes());
+                }
+                Some(b'$') if quote == b'"' && self.peek_at(1) == Some(b'{') => {
+                    self.pos += 1;
+                    out.push(b'$');
+                    let span = self.scan_matched(b'{', b'}', "parameter expansion ${...}")?;
+                    out.extend_from_slice(span.as_bytes());
+                }
+                Some(b'`') if quote == b'"' => {
+                    let span = self.scan_matched(b'`', b'`', "backtick substitution")?;
+                    out.extend_from_slice(span.as_bytes());
+                }
                 Some(c) if c == quote => {
                     out.push(self.bump().unwrap());
                     return Ok(String::from_utf8_lossy(&out).into_owned());
@@ -141,10 +205,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn is_word_boundary(&self, c: u8) -> bool {
-        matches!(
-            c,
-            b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'<' | b'>' | b'(' | b')' | b'{' | b'}'
-        )
+        matches!(c, b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'<' | b'>' | b'(' | b')')
     }
 
     fn scan_word(&mut self) -> Result<(String, bool), LexError> {
@@ -182,6 +243,19 @@ impl<'a> Lexer<'a> {
                     text.push('$');
                     text.push_str(&self.scan_matched(b'{', b'}', "parameter expansion ${...}")?);
                 }
+                // Process substitution is a word-level construct (it expands
+                // to a filename), not a redirect: `diff <(sort a) <(sort b)`.
+                Some(c @ (b'<' | b'>')) if self.peek_at(1) == Some(b'(') => {
+                    self.pos += 1;
+                    text.push(c as char);
+                    text.push_str(&self.scan_matched(b'(', b')', "process substitution")?);
+                }
+                // Array assignment: `x=(a b)` is one word; `(` is otherwise
+                // a boundary. Only after a literal `=` so ordinary words
+                // never swallow a subshell.
+                Some(b'(') if text.ends_with('=') => {
+                    text.push_str(&self.scan_matched(b'(', b')', "array assignment")?);
+                }
                 Some(b'\\') => {
                     text.push(self.bump().unwrap() as char);
                     if let Some(c) = self.bump() {
@@ -197,27 +271,84 @@ impl<'a> Lexer<'a> {
         Ok((text, quoted))
     }
 
-    /// Capture a heredoc body: everything from just after the current line's
-    /// end, up to (and consuming) a line that is exactly `delimiter` (after
-    /// stripping leading tabs, if `strip_tabs`). This is the raw-text mode
-    /// bash itself switches into once it sees `<<`/`<<-` and its delimiter —
-    /// the body is NEVER tokenized as bash syntax, which is exactly the gap
-    /// that broke every heredoc-containing command before this existed
-    /// (source with `(`/`{` inside the body was read as real bash tokens).
-    ///
-    /// Simplification, scoped to the corpus's actual dominant pattern (a
-    /// heredoc redirect is the last thing on its command line): starts
-    /// scanning from the next newline in the source, discarding whatever
-    /// (rare) tokens might follow the delimiter word on the same line. Real
-    /// bash defers the whole line's tokenization until the newline; getting
-    /// that fully right needs a token queue, not yet built.
-    pub fn capture_heredoc(&mut self, delimiter: &str, strip_tabs: bool) -> String {
-        while !matches!(self.peek(), None | Some(b'\n')) {
-            self.pos += 1;
+    /// The whitespace-separated chunks between `[[` and its closing `]]`,
+    /// quote- and `$()`-aware, `]]` consumed. Bash parses `[[ ]]` with its
+    /// own hand-rolled scanner outside the bison grammar (parse.y:5031-5249);
+    /// this is the equivalent seam. Whitespace-only splitting means
+    /// parenthesized groups need spaces (`[[ ( a == b ) ]]`), and a regex
+    /// operand like `^(a|b)$` survives as one chunk — which is exactly why
+    /// the main tokenizer can't be reused here (`|` and `(` would become
+    /// operators inside the regex).
+    pub fn cond_chunks(&mut self) -> Result<Vec<String>, LexError> {
+        let start = self.pos;
+        let mut chunks = Vec::new();
+        loop {
+            loop {
+                match self.peek() {
+                    Some(b' ') | Some(b'\t') | Some(b'\n') => self.pos += 1,
+                    Some(b'\\') if self.peek_at(1) == Some(b'\n') => self.pos += 2,
+                    _ => break,
+                }
+            }
+            if self.peek().is_none() {
+                return Err(LexError::UnterminatedBracket("[[ ]]", start));
+            }
+            // Closing `]]` — recognized before word-scanning so an operator
+            // right after it (`]]; then`, `]]&&`) stays with the main
+            // tokenizer instead of gluing onto the chunk.
+            if self.peek() == Some(b']')
+                && self.peek_at(1) == Some(b']')
+                && !matches!(self.peek_at(2), Some(c) if !self.is_word_boundary(c))
+            {
+                self.pos += 2;
+                return Ok(chunks);
+            }
+            let mut chunk = String::new();
+            loop {
+                match self.peek() {
+                    None | Some(b' ') | Some(b'\t') | Some(b'\n') => break,
+                    Some(b'\'') => chunk.push_str(&self.scan_quoted(b'\'')?),
+                    Some(b'"') => chunk.push_str(&self.scan_quoted(b'"')?),
+                    Some(b'`') => chunk.push_str(&self.scan_matched(b'`', b'`', "backtick substitution")?),
+                    Some(b'$') if self.peek_at(1) == Some(b'(') => {
+                        self.pos += 1;
+                        chunk.push('$');
+                        chunk.push_str(&self.scan_matched(b'(', b')', "command substitution $(...)")?);
+                    }
+                    Some(b'$') if self.peek_at(1) == Some(b'{') => {
+                        self.pos += 1;
+                        chunk.push('$');
+                        chunk.push_str(&self.scan_matched(b'{', b'}', "parameter expansion ${...}")?);
+                    }
+                    Some(b'\\') => {
+                        chunk.push(self.bump().unwrap() as char);
+                        if let Some(c) = self.bump() {
+                            chunk.push(c as char);
+                        }
+                    }
+                    Some(_) => chunk.push(self.bump().unwrap() as char),
+                }
+            }
+            chunks.push(chunk);
         }
-        if self.peek() == Some(b'\n') {
-            self.pos += 1;
+    }
+
+    fn capture_pending_heredocs(&mut self) {
+        let pending = std::mem::take(&mut self.pending_heredocs);
+        for (delimiter, strip_tabs) in pending {
+            let body = self.capture_heredoc_body(&delimiter, strip_tabs);
+            self.bodies.push_back(body);
         }
+    }
+
+    /// Capture one heredoc body: raw lines from the current position up to
+    /// (and consuming) a line that is exactly `delimiter` (after stripping
+    /// leading tabs, if `strip_tabs`). This is the raw-text mode bash itself
+    /// switches into after the line's newline — the body is NEVER tokenized
+    /// as bash syntax, which is exactly the gap that broke every
+    /// heredoc-containing command before this existed (source with `(`/`{`
+    /// inside the body was read as real bash tokens).
+    fn capture_heredoc_body(&mut self, delimiter: &str, strip_tabs: bool) -> String {
         let mut body = String::new();
         loop {
             let line_start = self.pos;
@@ -233,8 +364,7 @@ impl<'a> Lexer<'a> {
             if compare == delimiter {
                 break;
             }
-            let stored = if strip_tabs { line.trim_start_matches('\t') } else { line.as_str() };
-            body.push_str(stored);
+            body.push_str(compare);
             body.push('\n');
             if !had_newline {
                 break; // EOF with no closing delimiter found — best-effort, not an error here
@@ -246,9 +376,17 @@ impl<'a> Lexer<'a> {
     pub fn next_token(&mut self) -> Result<Token, LexError> {
         self.skip_blanks();
         match self.peek() {
-            None => Ok(Token::Eof),
+            None => {
+                if !self.pending_heredocs.is_empty() {
+                    self.capture_pending_heredocs();
+                }
+                Ok(Token::Eof)
+            }
             Some(b'\n') => {
                 self.pos += 1;
+                if !self.pending_heredocs.is_empty() {
+                    self.capture_pending_heredocs();
+                }
                 Ok(Token::Newline)
             }
             Some(b'#') => {
@@ -262,6 +400,14 @@ impl<'a> Lexer<'a> {
                 self.pos += 2;
                 Ok(Token::And)
             }
+            Some(b'&') if self.peek_at(1) == Some(b'>') && self.peek_at(2) == Some(b'>') => {
+                self.pos += 3;
+                Ok(Token::AmpDGreat)
+            }
+            Some(b'&') if self.peek_at(1) == Some(b'>') => {
+                self.pos += 2;
+                Ok(Token::AmpGreat)
+            }
             Some(b'&') => {
                 self.pos += 1;
                 Ok(Token::Amp)
@@ -274,9 +420,35 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
                 Ok(Token::Pipe)
             }
+            Some(b';') if self.peek_at(1) == Some(b';') && self.peek_at(2) == Some(b'&') => {
+                self.pos += 3;
+                Ok(Token::DSemiAmp)
+            }
+            Some(b';') if self.peek_at(1) == Some(b';') => {
+                self.pos += 2;
+                Ok(Token::DSemi)
+            }
+            Some(b';') if self.peek_at(1) == Some(b'&') => {
+                self.pos += 2;
+                Ok(Token::SemiAmp)
+            }
             Some(b';') => {
                 self.pos += 1;
                 Ok(Token::Semi)
+            }
+            Some(b'(') if self.peek_at(1) == Some(b'(') => {
+                // `((...))`: arithmetic command IF the balanced span ends in
+                // `))` — otherwise it was a subshell whose first command is
+                // itself parenthesized (`((echo a); echo b)`), so rewind and
+                // emit a plain `(`. Mirrors bash's own lookahead-to-`))`.
+                let start = self.pos;
+                match self.scan_matched(b'(', b')', "arithmetic command ((...))") {
+                    Ok(text) if text.ends_with("))") => Ok(Token::Arith(text)),
+                    _ => {
+                        self.pos = start + 1;
+                        Ok(Token::LParen)
+                    }
+                }
             }
             Some(b'(') => {
                 self.pos += 1;
@@ -285,14 +457,6 @@ impl<'a> Lexer<'a> {
             Some(b')') => {
                 self.pos += 1;
                 Ok(Token::RParen)
-            }
-            Some(b'{') => {
-                self.pos += 1;
-                Ok(Token::LBrace)
-            }
-            Some(b'}') => {
-                self.pos += 1;
-                Ok(Token::RBrace)
             }
             Some(b'<') if self.peek_at(1) == Some(b'<') && self.peek_at(2) == Some(b'<') => {
                 self.pos += 3;
@@ -306,6 +470,14 @@ impl<'a> Lexer<'a> {
                 self.pos += 2;
                 Ok(Token::DLess)
             }
+            Some(b'<') if self.peek_at(1) == Some(b'&') => {
+                self.pos += 2;
+                Ok(Token::LessAmp)
+            }
+            Some(b'<') if self.peek_at(1) == Some(b'(') => {
+                let (text, quoted) = self.scan_word()?;
+                Ok(Token::Word(text, quoted))
+            }
             Some(b'<') => {
                 self.pos += 1;
                 Ok(Token::Less)
@@ -317,6 +489,10 @@ impl<'a> Lexer<'a> {
             Some(b'>') if self.peek_at(1) == Some(b'&') => {
                 self.pos += 2;
                 Ok(Token::GreatAmp)
+            }
+            Some(b'>') if self.peek_at(1) == Some(b'(') => {
+                let (text, quoted) = self.scan_word()?;
+                Ok(Token::Word(text, quoted))
             }
             Some(b'>') => {
                 self.pos += 1;
