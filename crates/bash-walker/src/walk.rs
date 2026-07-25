@@ -30,6 +30,11 @@ pub enum Flow {
     Break(u32),
     Continue(u32),
     Fatal(String),
+    /// A failed redirect fails THAT command (status 1) and the script
+    /// continues — bash's behaviour, caught at each command boundary.
+    /// Turning this into `Fatal` was a real divergence the differential
+    /// replay caught: bash printed the error and carried on.
+    RedirectFailed(String),
 }
 
 #[derive(Clone)]
@@ -124,7 +129,13 @@ impl<'a> Exec<'a> {
             }
             Command::Background(inner) => self.exec_background(inner, ctx),
             Command::Redirected { command, redirects } => {
-                let ctx2 = self.apply_redirects(redirects, ctx)?;
+                let ctx2 = match self.apply_redirects(redirects, ctx) {
+                    Err(Flow::RedirectFailed(msg)) => {
+                        ctx.write_err(&format!("bash-walker: {msg}\n"));
+                        return Ok(1);
+                    }
+                    other => other?,
+                };
                 self.exec(command, &ctx2, tested)
             }
             Command::Subshell(inner) => self.run_subshell(inner, ctx, tested),
@@ -228,7 +239,22 @@ impl<'a> Exec<'a> {
                 match sub.prepare_simple(s, ctx)? {
                     Prepared::External { fields, assigns, redirects } => {
                         let stage_ctx = Ctx { stdin: stage_stdin, ..ctx.clone() };
-                        let stage_ctx = sub.apply_redirects(&redirects, &stage_ctx)?;
+                        let stage_ctx = match sub.apply_redirects(&redirects, &stage_ctx) {
+                            Err(Flow::RedirectFailed(msg)) => {
+                                ctx.write_err(&format!("bash-walker: {msg}\n"));
+                                statuses[i] = Some(1);
+                                waiting.push(None);
+                                if !last {
+                                    let empty = sub.anon_temp()?;
+                                    next_stdin = Some(Arc::new(empty));
+                                }
+                                if let Some(c) = saved_cwd {
+                                    let _ = std::env::set_current_dir(c);
+                                }
+                                continue;
+                            }
+                            other => other?,
+                        };
                         let stdout_to = if last {
                             SpawnOut::Ctx
                         } else {
@@ -330,7 +356,7 @@ impl<'a> Exec<'a> {
             // A stray break/continue/return cannot cross a subshell.
             Err(Flow::Break(_)) | Err(Flow::Continue(_)) => Ok(capture_status),
             Err(Flow::Return(st)) => Ok(st),
-            Err(f @ Flow::Fatal(_)) => Err(f),
+            Err(f @ (Flow::Fatal(_) | Flow::RedirectFailed(_))) => Err(f),
         }
     }
 
@@ -498,7 +524,13 @@ impl<'a> Exec<'a> {
             match sub.prepare_simple(s, ctx)? {
                 Prepared::External { fields, assigns, redirects } => {
                     let stage_ctx = Ctx { stdin: stage_stdin, ..ctx.clone() };
-                    let stage_ctx = sub.apply_redirects(&redirects, &stage_ctx)?;
+                    let stage_ctx = match sub.apply_redirects(&redirects, &stage_ctx) {
+                        Err(Flow::RedirectFailed(msg)) => {
+                            ctx.write_err(&format!("bash-walker: {msg}\n"));
+                            continue;
+                        }
+                        other => other?,
+                    };
                     let out = if last { SpawnOut::Ctx } else { SpawnOut::Pipe };
                     match sub.spawn(&fields, &assigns, &stage_ctx, out, ctx)?.take() {
                         SpawnResult::Child(mut ch) => {
@@ -597,7 +629,13 @@ impl<'a> Exec<'a> {
             }
         };
 
-        let ctx2 = self.apply_redirects(&s.redirects, ctx)?;
+        let ctx2 = match self.apply_redirects(&s.redirects, ctx) {
+            Err(Flow::RedirectFailed(msg)) => {
+                ctx.write_err(&format!("bash-walker: {msg}\n"));
+                return Ok(1);
+            }
+            other => other?,
+        };
 
         if fields.is_empty() {
             for (k, v) in assigns {
@@ -731,7 +769,7 @@ impl<'a> Exec<'a> {
                         .append(r.op == RedirectOp::Append)
                         .truncate(r.op == RedirectOp::Out)
                         .open(&path)
-                        .map_err(|e| Flow::Fatal(format!("{path}: {e}")))?;
+                        .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
                     match r.fd {
                         None | Some(1) => c.stdout = Arc::new(f),
                         Some(2) => c.stderr = Arc::new(f),
@@ -750,14 +788,15 @@ impl<'a> Exec<'a> {
                         .append(r.op == RedirectOp::AppendOutErr)
                         .truncate(r.op == RedirectOp::OutErr)
                         .open(&path)
-                        .map_err(|e| Flow::Fatal(format!("{path}: {e}")))?;
+                        .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
                     let f = Arc::new(f);
                     c.stdout = Arc::clone(&f);
                     c.stderr = f;
                 }
                 RedirectOp::In => {
                     let path = expand::expand_redirect_target(self, &c, &r.target)?;
-                    let f = File::open(&path).map_err(|e| Flow::Fatal(format!("{path}: {e}")))?;
+                    let f = File::open(&path)
+                        .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
                     c.stdin = Some(Arc::new(f));
                 }
                 RedirectOp::DupOut => {
@@ -876,6 +915,16 @@ fn errexit_eligible(cmd: &Command) -> bool {
             | Command::Invert(_)
             | Command::FunctionDef { .. }
     )
+}
+
+/// io::Error's Display appends " (os error N)"; bash's messages don't.
+/// Agents read these strings, so speak bash's dialect.
+pub fn errmsg(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error") {
+        Some(pos) => s[..pos].to_string(),
+        None => s,
+    }
 }
 
 fn s_signal(st: &std::process::ExitStatus) -> i32 {

@@ -12,6 +12,7 @@ use crate::walk::{Ctx, Exec, Flow};
 const NATIVE: &[&str] = &[
     "cd", "pwd", "export", "unset", "local", "exit", "return", "break", "continue", "shift",
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
+    "echo", "printf",
 ];
 
 const UNSUPPORTED: &[&str] = &[
@@ -125,7 +126,7 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
                 return Ok(2);
             };
             let src = std::fs::read_to_string(path)
-                .map_err(|e| Flow::Fatal(format!("source {path}: {e}")))?;
+                .map_err(|e| Flow::Fatal(format!("source {path}: {}", crate::walk::errmsg(&e))))?;
             let saved = if args.len() > 1 {
                 Some(std::mem::replace(&mut ex.state.positional, args[1..].to_vec()))
             } else {
@@ -142,6 +143,11 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
         }
         ":" | "true" => Ok(0),
         "false" => Ok(1),
+        // Native because the recordings and real bash use the BUILTIN echo
+        // and printf; the external binaries (BSD ones in particular)
+        // diverge on flags, escapes, and error shapes.
+        "echo" => echo(ctx, args),
+        "printf" => printf(ex, ctx, args),
         "command" => command(ex, ctx, args),
         "let" => {
             let mut v = 0;
@@ -154,6 +160,502 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
             "the '{other}' builtin is not supported by bash-walker"
         ))),
         other => Err(Flow::Fatal(format!("not a builtin: {other}"))),
+    }
+}
+
+fn echo(ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    let mut newline = true;
+    let mut escapes = false;
+    let mut i = 0;
+    // Only pure combinations of n/e/E are flags; anything else (including
+    // `--`) prints as an ordinary argument, exactly like bash.
+    while i < args.len() {
+        let a = &args[i];
+        if a.len() >= 2 && a.starts_with('-') && a[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E')) {
+            for c in a[1..].chars() {
+                match c {
+                    'n' => newline = false,
+                    'e' => escapes = true,
+                    'E' => escapes = false,
+                    _ => unreachable!(),
+                }
+            }
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let joined = args[i..].join(" ");
+    let mut out = String::new();
+    let mut suppress_newline = !newline;
+    if escapes {
+        let b: Vec<char> = joined.chars().collect();
+        let mut k = 0;
+        'outer: while k < b.len() {
+            if b[k] == '\\' && k + 1 < b.len() {
+                let (c, used) = match b[k + 1] {
+                    'n' => ('\n', 2),
+                    't' => ('\t', 2),
+                    'r' => ('\r', 2),
+                    'a' => ('\x07', 2),
+                    'b' => ('\x08', 2),
+                    'e' | 'E' => ('\x1b', 2),
+                    'f' => ('\x0c', 2),
+                    'v' => ('\x0b', 2),
+                    '\\' => ('\\', 2),
+                    'c' => {
+                        // \c: stop all output, no trailing newline
+                        suppress_newline = true;
+                        break 'outer;
+                    }
+                    '0' => {
+                        let oct: String = b[k + 2..]
+                            .iter()
+                            .copied()
+                            .take(3)
+                            .take_while(|c| c.is_digit(8))
+                            .collect();
+                        let v = u8::from_str_radix(&oct, 8).unwrap_or(0);
+                        out.push(v as char);
+                        k += 2 + oct.len();
+                        continue;
+                    }
+                    'x' => {
+                        let hex: String = b[k + 2..]
+                            .iter()
+                            .copied()
+                            .take(2)
+                            .take_while(|c| c.is_ascii_hexdigit())
+                            .collect();
+                        if hex.is_empty() {
+                            out.push('\\');
+                            out.push('x');
+                            k += 2;
+                            continue;
+                        }
+                        let v = u8::from_str_radix(&hex, 16).unwrap_or(0);
+                        out.push(v as char);
+                        k += 2 + hex.len();
+                        continue;
+                    }
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                        k += 2;
+                        continue;
+                    }
+                };
+                out.push(c);
+                k += used;
+            } else {
+                out.push(b[k]);
+                k += 1;
+            }
+        }
+    } else {
+        out = joined;
+    }
+    if !suppress_newline {
+        out.push('\n');
+    }
+    ctx.write_out(&out);
+    Ok(0)
+}
+
+fn printf(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    let mut i = 0;
+    let mut var_target: Option<String> = None;
+    match args.first().map(String::as_str) {
+        Some("-v") => {
+            let Some(v) = args.get(1) else {
+                ctx.write_err("bash-walker: printf: -v: option requires an argument\n");
+                return Ok(2);
+            };
+            var_target = Some(v.clone());
+            i = 2;
+        }
+        Some("--") => i = 1,
+        Some(a) if a.starts_with('-') && a.len() > 1 => {
+            // bash reports the offending option as `--` for `--...`, else -X
+            let opt = if a.starts_with("--") { "--".to_string() } else { a[..2].to_string() };
+            ctx.write_err(&format!(
+                "bash-walker: printf: {opt}: invalid option\nprintf: usage: printf [-v var] format [arguments]\n"
+            ));
+            return Ok(2);
+        }
+        _ => {}
+    }
+    let Some(format) = args.get(i) else {
+        ctx.write_err("bash-walker: printf: usage: printf [-v var] format [arguments]\n");
+        return Ok(2);
+    };
+    let rest = &args[i + 1..];
+    let mut out = String::new();
+    let mut status = 0;
+    let mut argi = 0;
+    loop {
+        let before = argi;
+        let stop = render_format(format, rest, &mut argi, &mut out, &mut status, ctx);
+        if stop || argi >= rest.len() || argi == before {
+            break;
+        }
+    }
+    match var_target {
+        Some(v) => ex.state.set_var(&v, out),
+        None => ctx.write_out(&out),
+    }
+    Ok(status)
+}
+
+/// One pass over the format string; returns true on `\c` (stop everything).
+fn render_format(
+    format: &str,
+    args: &[String],
+    argi: &mut usize,
+    out: &mut String,
+    status: &mut i32,
+    ctx: &Ctx,
+) -> bool {
+    let chars: Vec<char> = format.chars().collect();
+    let mut k = 0;
+    while k < chars.len() {
+        match chars[k] {
+            '\\' if k + 1 < chars.len() => {
+                let (decoded, used, stop) = decode_escape(&chars[k..]);
+                if stop {
+                    return true;
+                }
+                out.push_str(&decoded);
+                k += used;
+            }
+            '%' if k + 1 < chars.len() && chars[k + 1] == '%' => {
+                out.push('%');
+                k += 2;
+            }
+            '%' => {
+                let spec_start = k;
+                k += 1;
+                let mut flags = String::new();
+                while k < chars.len() && matches!(chars[k], '-' | '+' | ' ' | '#' | '0') {
+                    flags.push(chars[k]);
+                    k += 1;
+                }
+                let mut width = String::new();
+                if k < chars.len() && chars[k] == '*' {
+                    width = next_arg(args, argi).unwrap_or_default();
+                    k += 1;
+                } else {
+                    while k < chars.len() && chars[k].is_ascii_digit() {
+                        width.push(chars[k]);
+                        k += 1;
+                    }
+                }
+                let mut precision: Option<String> = None;
+                if k < chars.len() && chars[k] == '.' {
+                    k += 1;
+                    if k < chars.len() && chars[k] == '*' {
+                        precision = Some(next_arg(args, argi).unwrap_or_default());
+                        k += 1;
+                    } else {
+                        let mut p = String::new();
+                        while k < chars.len() && chars[k].is_ascii_digit() {
+                            p.push(chars[k]);
+                            k += 1;
+                        }
+                        precision = Some(p);
+                    }
+                }
+                let Some(conv) = chars.get(k).copied() else {
+                    // trailing bare % prints literally, like bash
+                    out.push_str(&chars[spec_start..].iter().collect::<String>());
+                    break;
+                };
+                k += 1;
+                let width: Option<i64> = width.parse().ok();
+                let prec: Option<usize> = precision.and_then(|p| p.parse().ok().or(Some(0)));
+                render_conversion(conv, &flags, width, prec, args, argi, out, status, ctx);
+            }
+            c => {
+                out.push(c);
+                k += 1;
+            }
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_conversion(
+    conv: char,
+    flags: &str,
+    width: Option<i64>,
+    prec: Option<usize>,
+    args: &[String],
+    argi: &mut usize,
+    out: &mut String,
+    status: &mut i32,
+    ctx: &Ctx,
+) {
+    let body = match conv {
+        's' => {
+            let a = next_arg(args, argi).unwrap_or_default();
+            match prec {
+                Some(p) => a.chars().take(p).collect(),
+                None => a,
+            }
+        }
+        'b' => {
+            let a = next_arg(args, argi).unwrap_or_default();
+            let chars: Vec<char> = a.chars().collect();
+            let mut s = String::new();
+            let mut j = 0;
+            while j < chars.len() {
+                if chars[j] == '\\' && j + 1 < chars.len() {
+                    let (decoded, used, stop) = decode_escape(&chars[j..]);
+                    if stop {
+                        break;
+                    }
+                    s.push_str(&decoded);
+                    j += used;
+                } else {
+                    s.push(chars[j]);
+                    j += 1;
+                }
+            }
+            s
+        }
+        'q' => shell_quote(&next_arg(args, argi).unwrap_or_default()),
+        'c' => next_arg(args, argi)
+            .unwrap_or_default()
+            .chars()
+            .next()
+            .map(String::from)
+            .unwrap_or_default(),
+        'd' | 'i' | 'u' | 'o' | 'x' | 'X' => {
+            let a = next_arg(args, argi).unwrap_or_default();
+            let v = parse_printf_int(&a).unwrap_or_else(|| {
+                if !a.is_empty() {
+                    ctx.write_err(&format!("bash-walker: printf: {a}: invalid number\n"));
+                    *status = 1;
+                }
+                0
+            });
+            let mut s = match conv {
+                'o' => format!("{v:o}"),
+                'x' => format!("{v:x}"),
+                'X' => format!("{v:X}"),
+                _ => v.abs().to_string(),
+            };
+            if matches!(conv, 'd' | 'i' | 'u') {
+                if v < 0 {
+                    s = format!("-{s}");
+                } else if flags.contains('+') {
+                    s = format!("+{s}");
+                } else if flags.contains(' ') {
+                    s = format!(" {s}");
+                }
+            } else if flags.contains('#') && v != 0 {
+                s = match conv {
+                    'o' => format!("0{s}"),
+                    'x' => format!("0x{s}"),
+                    'X' => format!("0X{s}"),
+                    _ => s,
+                };
+            }
+            return pad_number(out, &s, flags, width);
+        }
+        'e' | 'E' | 'f' | 'F' | 'g' | 'G' => {
+            let a = next_arg(args, argi).unwrap_or_default();
+            let v: f64 = a.trim().parse().unwrap_or_else(|_| {
+                if !a.is_empty() {
+                    ctx.write_err(&format!("bash-walker: printf: {a}: invalid number\n"));
+                    *status = 1;
+                }
+                0.0
+            });
+            let p = prec.unwrap_or(6);
+            let s = match conv {
+                'f' | 'F' => format!("{v:.p$}"),
+                'e' | 'E' => {
+                    let s = format!("{v:.p$e}");
+                    let s = c_style_exponent(&s);
+                    if conv == 'E' { s.to_uppercase() } else { s }
+                }
+                _ => {
+                    // %g: shortest of %e/%f with trailing zeros trimmed
+                    let s = format!("{v}");
+                    if conv == 'G' { s.to_uppercase() } else { s }
+                }
+            };
+            return pad_number(out, &s, flags, width);
+        }
+        other => {
+            ctx.write_err(&format!("bash-walker: printf: `{other}': invalid format character\n"));
+            *status = 1;
+            return;
+        }
+    };
+    // string-like padding
+    let w = width.unwrap_or(0).unsigned_abs() as usize;
+    let left = flags.contains('-') || width.is_some_and(|w| w < 0);
+    let len = body.chars().count();
+    if len >= w {
+        out.push_str(&body);
+    } else if left {
+        out.push_str(&body);
+        out.extend(std::iter::repeat_n(' ', w - len));
+    } else {
+        out.extend(std::iter::repeat_n(' ', w - len));
+        out.push_str(&body);
+    }
+}
+
+fn pad_number(out: &mut String, s: &str, flags: &str, width: Option<i64>) {
+    let w = width.unwrap_or(0).unsigned_abs() as usize;
+    let left = flags.contains('-') || width.is_some_and(|w| w < 0);
+    let len = s.chars().count();
+    if len >= w {
+        out.push_str(s);
+    } else if left {
+        out.push_str(s);
+        out.extend(std::iter::repeat_n(' ', w - len));
+    } else if flags.contains('0') {
+        // zero-padding goes between the sign and the digits
+        let (sign, digits) = match s.strip_prefix(['-', '+', ' ']) {
+            Some(d) => (&s[..1], d),
+            None => ("", s),
+        };
+        out.push_str(sign);
+        out.extend(std::iter::repeat_n('0', w - len));
+        out.push_str(digits);
+    } else {
+        out.extend(std::iter::repeat_n(' ', w - len));
+        out.push_str(s);
+    }
+}
+
+fn next_arg(args: &[String], argi: &mut usize) -> Option<String> {
+    let a = args.get(*argi).cloned();
+    if a.is_some() {
+        *argi += 1;
+    }
+    a
+}
+
+/// bash printf integer parsing: strtoll base 0 (0x hex, leading-0 octal),
+/// plus the `'A` form meaning the character's code point.
+fn parse_printf_int(a: &str) -> Option<i64> {
+    let t = a.trim();
+    if let Some(rest) = t.strip_prefix('\'').or_else(|| t.strip_prefix('"')) {
+        return rest.chars().next().map(|c| c as i64);
+    }
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i64::from_str_radix(h, 16).ok()?
+    } else if t.len() > 1 && t.starts_with('0') {
+        i64::from_str_radix(&t[1..], 8).ok()?
+    } else {
+        t.parse().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
+fn c_style_exponent(s: &str) -> String {
+    // Rust: "1.5e2" / "1.5e-2"; C: "1.5e+02" / "1.5e-02"
+    match s.split_once('e') {
+        Some((m, exp)) => {
+            let (sign, digits) = match exp.strip_prefix('-') {
+                Some(d) => ('-', d),
+                None => ('+', exp),
+            };
+            format!("{m}e{sign}{digits:0>2}")
+        }
+        None => s.to_string(),
+    }
+}
+
+/// `%q`: bash's backslash-quoting; control characters force $'...' form.
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if s.chars().any(|c| (c as u32) < 0x20 || c == '\x7f') {
+        let mut q = String::from("$'");
+        for c in s.chars() {
+            match c {
+                '\n' => q.push_str("\\n"),
+                '\t' => q.push_str("\\t"),
+                '\r' => q.push_str("\\r"),
+                '\'' => q.push_str("\\'"),
+                '\\' => q.push_str("\\\\"),
+                c if (c as u32) < 0x20 => q.push_str(&format!("\\{:03o}", c as u32)),
+                c => q.push(c),
+            }
+        }
+        q.push('\'');
+        return q;
+    }
+    let mut q = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '@' | '+' | '%' | ',' | '^') || !c.is_ascii() {
+            q.push(c);
+        } else {
+            q.push('\\');
+            q.push(c);
+        }
+    }
+    q
+}
+
+/// printf/echo escape at `chars[0] == '\\'`: (decoded, chars consumed,
+/// stop-output). `\c` in printf's %b and echo -e stops everything.
+fn decode_escape(chars: &[char]) -> (String, usize, bool) {
+    match chars.get(1) {
+        None => ("\\".to_string(), 1, false),
+        Some('n') => ("\n".into(), 2, false),
+        Some('t') => ("\t".into(), 2, false),
+        Some('r') => ("\r".into(), 2, false),
+        Some('a') => ("\x07".into(), 2, false),
+        Some('b') => ("\x08".into(), 2, false),
+        Some('e') | Some('E') => ("\x1b".into(), 2, false),
+        Some('f') => ("\x0c".into(), 2, false),
+        Some('v') => ("\x0b".into(), 2, false),
+        Some('\\') => ("\\".into(), 2, false),
+        Some('"') => ("\"".into(), 2, false),
+        Some('\'') => ("'".into(), 2, false),
+        Some('c') => (String::new(), 2, true),
+        Some('x') => {
+            let hex: String = chars[2..]
+                .iter()
+                .copied()
+                .take(2)
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect();
+            if hex.is_empty() {
+                ("\\x".into(), 2, false)
+            } else {
+                let v = u8::from_str_radix(&hex, 16).unwrap_or(0);
+                ((v as char).to_string(), 2 + hex.len(), false)
+            }
+        }
+        Some(d) if d.is_digit(8) => {
+            let oct: String = chars[1..]
+                .iter()
+                .copied()
+                .take(3)
+                .take_while(|c| c.is_digit(8))
+                .collect();
+            let v = u32::from_str_radix(&oct, 8).unwrap_or(0) & 0xff;
+            (
+                char::from_u32(v).unwrap_or('\0').to_string(),
+                1 + oct.len(),
+                false,
+            )
+        }
+        Some(other) => (format!("\\{other}"), 2, false),
     }
 }
 
@@ -196,7 +698,7 @@ fn cd(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
             Ok(0)
         }
         Err(e) => {
-            ctx.write_err(&format!("bash-walker: cd: {target}: {e}\n"));
+            ctx.write_err(&format!("bash-walker: cd: {target}: {}\n", crate::walk::errmsg(&e)));
             Ok(1)
         }
     }

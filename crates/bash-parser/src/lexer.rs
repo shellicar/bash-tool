@@ -208,21 +208,26 @@ impl<'a> Lexer<'a> {
         matches!(c, b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'<' | b'>' | b'(' | b')')
     }
 
+    // Accumulates BYTES, decoding once at the end: pushing `byte as char`
+    // re-encodes each UTF-8 continuation byte as its own Latin-1 character,
+    // silently mangling any non-ASCII word (✓, → — common in echo text).
     fn scan_word(&mut self) -> Result<(String, bool), LexError> {
-        let mut text = String::new();
+        let mut text = Vec::<u8>::new();
         let mut quoted = false;
         loop {
             match self.peek() {
                 Some(b'\'') => {
                     quoted = true;
-                    text.push_str(&self.scan_quoted(b'\'')?);
+                    text.extend_from_slice(self.scan_quoted(b'\'')?.as_bytes());
                 }
                 Some(b'"') => {
                     quoted = true;
-                    text.push_str(&self.scan_quoted(b'"')?);
+                    text.extend_from_slice(self.scan_quoted(b'"')?.as_bytes());
                 }
                 Some(b'`') => {
-                    text.push_str(&self.scan_matched(b'`', b'`', "backtick substitution")?);
+                    text.extend_from_slice(
+                        self.scan_matched(b'`', b'`', "backtick substitution")?.as_bytes(),
+                    );
                 }
                 // `$((...))` needs no special case: the depth counter takes
                 // the whole balanced span, and arithmetic-vs-command-
@@ -232,40 +237,48 @@ impl<'a> Lexer<'a> {
                 // into `$(x+1))` — found by a walker end-to-end test.
                 Some(b'$') if self.peek_at(1) == Some(b'(') => {
                     self.pos += 1; // consume "$"
-                    text.push('$');
-                    text.push_str(&self.scan_matched(b'(', b')', "command substitution $(...)")?);
+                    text.push(b'$');
+                    text.extend_from_slice(
+                        self.scan_matched(b'(', b')', "command substitution $(...)")?.as_bytes(),
+                    );
                 }
                 Some(b'$') if self.peek_at(1) == Some(b'{') => {
                     self.pos += 1;
-                    text.push('$');
-                    text.push_str(&self.scan_matched(b'{', b'}', "parameter expansion ${...}")?);
+                    text.push(b'$');
+                    text.extend_from_slice(
+                        self.scan_matched(b'{', b'}', "parameter expansion ${...}")?.as_bytes(),
+                    );
                 }
                 // Process substitution is a word-level construct (it expands
                 // to a filename), not a redirect: `diff <(sort a) <(sort b)`.
                 Some(c @ (b'<' | b'>')) if self.peek_at(1) == Some(b'(') => {
                     self.pos += 1;
-                    text.push(c as char);
-                    text.push_str(&self.scan_matched(b'(', b')', "process substitution")?);
+                    text.push(c);
+                    text.extend_from_slice(
+                        self.scan_matched(b'(', b')', "process substitution")?.as_bytes(),
+                    );
                 }
                 // Array assignment: `x=(a b)` is one word; `(` is otherwise
                 // a boundary. Only after a literal `=` so ordinary words
                 // never swallow a subshell.
-                Some(b'(') if text.ends_with('=') => {
-                    text.push_str(&self.scan_matched(b'(', b')', "array assignment")?);
+                Some(b'(') if text.last() == Some(&b'=') => {
+                    text.extend_from_slice(
+                        self.scan_matched(b'(', b')', "array assignment")?.as_bytes(),
+                    );
                 }
                 Some(b'\\') => {
-                    text.push(self.bump().unwrap() as char);
+                    text.push(self.bump().unwrap());
                     if let Some(c) = self.bump() {
-                        text.push(c as char);
+                        text.push(c);
                     }
                 }
                 Some(c) if !self.is_word_boundary(c) => {
-                    text.push(self.bump().unwrap() as char);
+                    text.push(self.bump().unwrap());
                 }
                 _ => break,
             }
         }
-        Ok((text, quoted))
+        Ok((String::from_utf8_lossy(&text).into_owned(), quoted))
     }
 
     /// The whitespace-separated chunks between `[[` and its closing `]]`,
@@ -300,33 +313,39 @@ impl<'a> Lexer<'a> {
                 self.pos += 2;
                 return Ok(chunks);
             }
-            let mut chunk = String::new();
+            let mut chunk = Vec::<u8>::new();
             loop {
                 match self.peek() {
                     None | Some(b' ') | Some(b'\t') | Some(b'\n') => break,
-                    Some(b'\'') => chunk.push_str(&self.scan_quoted(b'\'')?),
-                    Some(b'"') => chunk.push_str(&self.scan_quoted(b'"')?),
-                    Some(b'`') => chunk.push_str(&self.scan_matched(b'`', b'`', "backtick substitution")?),
+                    Some(b'\'') => chunk.extend_from_slice(self.scan_quoted(b'\'')?.as_bytes()),
+                    Some(b'"') => chunk.extend_from_slice(self.scan_quoted(b'"')?.as_bytes()),
+                    Some(b'`') => chunk.extend_from_slice(
+                        self.scan_matched(b'`', b'`', "backtick substitution")?.as_bytes(),
+                    ),
                     Some(b'$') if self.peek_at(1) == Some(b'(') => {
                         self.pos += 1;
-                        chunk.push('$');
-                        chunk.push_str(&self.scan_matched(b'(', b')', "command substitution $(...)")?);
+                        chunk.push(b'$');
+                        chunk.extend_from_slice(
+                            self.scan_matched(b'(', b')', "command substitution $(...)")?.as_bytes(),
+                        );
                     }
                     Some(b'$') if self.peek_at(1) == Some(b'{') => {
                         self.pos += 1;
-                        chunk.push('$');
-                        chunk.push_str(&self.scan_matched(b'{', b'}', "parameter expansion ${...}")?);
+                        chunk.push(b'$');
+                        chunk.extend_from_slice(
+                            self.scan_matched(b'{', b'}', "parameter expansion ${...}")?.as_bytes(),
+                        );
                     }
                     Some(b'\\') => {
-                        chunk.push(self.bump().unwrap() as char);
+                        chunk.push(self.bump().unwrap());
                         if let Some(c) = self.bump() {
-                            chunk.push(c as char);
+                            chunk.push(c);
                         }
                     }
-                    Some(_) => chunk.push(self.bump().unwrap() as char),
+                    Some(_) => chunk.push(self.bump().unwrap()),
                 }
             }
-            chunks.push(chunk);
+            chunks.push(String::from_utf8_lossy(&chunk).into_owned());
         }
     }
 

@@ -424,6 +424,53 @@ fn command_v_finds_a_program_on_path() {
 }
 
 #[test]
+fn multibyte_utf8_survives_the_pipeline() {
+    // Real corpus mismatch: ✓ and → came out as mojibake because lexer and
+    // expander pushed bytes as chars.
+    let (output, _) = run("echo \"✓ done → next\" && echo '✓ quoted'");
+
+    let expected = "✓ done → next\n✓ quoted\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn failed_redirect_fails_the_command_but_not_the_script() {
+    // bash prints the error, sets $? to 1, and continues; aborting the whole
+    // invocation was a real divergence the differential replay caught.
+    let (output, status) = run("echo x > /nonexistent-dir-bw/f; echo after $?");
+
+    assert_eq!(status, 0);
+    assert!(output.contains("No such file or directory"), "output: {output:?}");
+    assert!(output.contains("after 1"), "output: {output:?}");
+}
+
+#[test]
+fn printf_is_native_with_bash_number_and_padding_rules() {
+    let (output, status) = run("printf '%05d|%-4s|%x|%s\\n' 42 ab 255 end");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "00042|ab  |ff|end\n");
+}
+
+#[test]
+fn printf_reuses_the_format_until_arguments_are_exhausted() {
+    let (output, _) = run("printf '[%s]' a b c");
+
+    let expected = "[a][b][c]";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn printf_dash_prefixed_format_is_an_invalid_option() {
+    // bash builtin behaviour: rc 2 and the `--` diagnostic — the external
+    // BSD printf says something else entirely.
+    let (output, status) = run("printf '--- a/file.txt\\n'");
+
+    assert_eq!(status, 2);
+    assert!(output.contains("invalid option"), "output: {output:?}");
+}
+
+#[test]
 fn syntax_error_reports_status_2() {
     let (output, status) = run("if true; then");
 

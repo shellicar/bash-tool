@@ -39,7 +39,7 @@ pub fn run(src: &str, state: &mut ShellState) -> (String, i32) {
         Err(Flow::Exit(st)) => st,
         Err(Flow::Return(st)) => st,
         Err(Flow::Break(_)) | Err(Flow::Continue(_)) => 0,
-        Err(Flow::Fatal(msg)) => {
+        Err(Flow::Fatal(msg)) | Err(Flow::RedirectFailed(msg)) => {
             ctx.write_err(&format!("bash-walker: {msg}\n"));
             if msg.starts_with("syntax error") {
                 2

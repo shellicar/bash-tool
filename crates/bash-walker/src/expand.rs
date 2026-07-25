@@ -54,7 +54,7 @@ pub fn expand_single(ex: &mut Exec, ctx: &Ctx, word: &Word) -> Result<String, Fl
 pub fn expand_redirect_target(ex: &mut Exec, ctx: &Ctx, word: &Word) -> Result<String, Flow> {
     let fields = expand_fields(ex, ctx, std::slice::from_ref(word))?;
     if fields.len() != 1 {
-        return Err(Flow::Fatal(format!("{}: ambiguous redirect", word.text)));
+        return Err(Flow::RedirectFailed(format!("{}: ambiguous redirect", word.text)));
     }
     Ok(fields.into_iter().next().unwrap())
 }
@@ -123,9 +123,12 @@ pub fn expand_textual(ex: &mut Exec, ctx: &Ctx, raw: &str) -> Result<String, Flo
                 }
                 i = next;
             }
-            c => {
-                out.push(c as char);
-                i += 1;
+            _ => {
+                let start = i;
+                while i < b.len() && !matches!(b[i], b'\\' | b'$' | b'`') {
+                    i += 1;
+                }
+                out.push_str(&raw[start..i]);
             }
         }
     }
@@ -442,9 +445,14 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                                 }
                             }
                         }
-                        c => {
-                            lit.push(c as char);
-                            i += 1;
+                        _ => {
+                            // slurp the literal run as a str slice — per-byte
+                            // `as char` pushes mangle multibyte UTF-8
+                            let start = i;
+                            while i < b.len() && !matches!(b[i], b'"' | b'\\' | b'$' | b'`') {
+                                i += 1;
+                            }
+                            lit.push_str(&raw[start..i]);
                         }
                     }
                 }
@@ -456,8 +464,11 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                     if b[i + 1] == b'\n' {
                         i += 2; // line continuation vanishes
                     } else {
-                        items.push(Item::Text { s: (b[i + 1] as char).to_string(), quoted: true });
-                        i += 2;
+                        // escape the WHOLE next char, not just its first byte
+                        let n = utf8_len(b[i + 1]);
+                        let end = (i + 1 + n).min(b.len());
+                        items.push(Item::Text { s: raw[i + 1..end].to_string(), quoted: true });
+                        i = end;
                     }
                 } else {
                     items.push(Item::Text { s: "\\".to_string(), quoted: true });
@@ -592,7 +603,15 @@ fn ansi_c_quote(raw: &str, quote_start: usize) -> (String, usize) {
     let mut out = String::new();
     let mut i = quote_start + 1;
     while i < b.len() && b[i] != b'\'' {
-        if b[i] == b'\\' && i + 1 < b.len() {
+        if b[i] != b'\\' {
+            let start = i;
+            while i < b.len() && b[i] != b'\\' && b[i] != b'\'' {
+                i += 1;
+            }
+            out.push_str(&raw[start..i]);
+            continue;
+        }
+        if i + 1 < b.len() {
             let (c, used) = match b[i + 1] {
                 b'n' => ('\n', 2),
                 b't' => ('\t', 2),
@@ -620,11 +639,20 @@ fn ansi_c_quote(raw: &str, quote_start: usize) -> (String, usize) {
             out.push(c);
             i += used;
         } else {
-            out.push(b[i] as char);
+            out.push('\\');
             i += 1;
         }
     }
     (out, i + 1)
+}
+
+fn utf8_len(b0: u8) -> usize {
+    match b0 {
+        0xF0..=0xF7 => 4,
+        0xE0..=0xEF => 3,
+        0xC0..=0xDF => 2,
+        _ => 1,
+    }
 }
 
 fn matched_paren(b: &[u8], open: usize) -> Option<usize> {
