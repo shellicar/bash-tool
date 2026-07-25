@@ -1,0 +1,17 @@
+[package]
+name = "bash-parser"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# A real bash parser, scoped to and validated against this project's own real
+# corpus (docs/ast-execution.md) rather than aiming at full POSIX/bash
+# reimplementation. Grammar informed directly by reading GNU Bash 5.3's own
+# parse.y/command.h (~/repos/gnu/bash) — not a third-party port.
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

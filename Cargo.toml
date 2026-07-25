@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/bash-parser", "crates/bash-walker"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Shared lints; crates opt in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+clone_on_ref_ptr = "warn"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
