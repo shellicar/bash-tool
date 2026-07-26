@@ -110,6 +110,12 @@ pub fn expand_textual(ex: &mut Exec, ctx: &Ctx, raw: &str) -> Result<String, Flo
                 out.push(b[i + 1] as char);
                 i += 2;
             }
+            // same latent infinite loop as the dquote arm: an unrecognized
+            // backslash escape must still advance
+            b'\\' => {
+                out.push('\\');
+                i += 1;
+            }
             b'$' | b'`' => {
                 let (text, next) = expand_dollar(ex, ctx, raw, i)?;
                 match text {
@@ -419,6 +425,15 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                             i += 2;
                         }
                         b'\\' if i + 1 < b.len() && b[i + 1] == b'\n' => i += 2,
+                        // backslash before an ordinary char stays literal
+                        // (`\|` in `grep "a\|b"`). Without this arm the run-
+                        // slurp below never advances past the backslash — an
+                        // INFINITE LOOP found live: the walker hung on
+                        // `grep "x\|y"` while bash took 0.1s.
+                        b'\\' => {
+                            lit.push('\\');
+                            i += 1;
+                        }
                         b'$' | b'`' => {
                             match expand_dollar(ex, ctx, &raw, i)? {
                                 (Expanded::One(s), next) => {

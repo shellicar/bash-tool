@@ -471,6 +471,25 @@ fn printf_dash_prefixed_format_is_an_invalid_option() {
 }
 
 #[test]
+fn backslash_alternation_in_double_quotes_expands_and_terminates() {
+    // `grep "a\|b"` hung the walker forever: the dquote expander had no arm
+    // for backslash-before-ordinary-char and never advanced. Found live in
+    // the first frozen-set run; bash ran the same command in 0.1s.
+    let (output, status) = run("printf 'alpha\\nbeta\\n' | grep \"alpha\\|gamma\"");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "alpha\n");
+}
+
+#[test]
+fn backslash_in_heredoc_body_expands_and_terminates() {
+    let (output, status) = run("cat <<EOF\na\\|b\nEOF");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "a\\|b\n");
+}
+
+#[test]
 fn syntax_error_reports_status_2() {
     let (output, status) = run("if true; then");
 

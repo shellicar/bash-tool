@@ -103,6 +103,9 @@ struct Tally {
     walker_unsupported: usize,
     timeouts: usize,
     mismatches: Vec<(String, String, String)>,
+    /// Never leave this bucket unexamined again: the walker's `grep "a\|b"`
+    /// infinite loop hid in it as "slow commands" for a whole run.
+    timeout_samples: Vec<String>,
 }
 
 fn run_against_bash(bash: &Path, commands_path: &str, cap: usize) {
@@ -164,6 +167,7 @@ fn run_against_bash(bash: &Path, commands_path: &str, cap: usize) {
             total.walker_unsupported += t.walker_unsupported;
             total.timeouts += t.timeouts;
             total.mismatches.extend(t.mismatches);
+            total.timeout_samples.extend(t.timeout_samples);
         }
         total
     });
@@ -188,12 +192,21 @@ fn run_against_bash(bash: &Path, commands_path: &str, cap: usize) {
         compared - tally.matched - tally.normalized_matched
     );
     print_mismatches(&tally.mismatches[..tally.mismatches.len().min(40)]);
+    if !tally.timeout_samples.is_empty() {
+        println!("timeout samples (side that timed out):");
+        for s in tally.timeout_samples.iter().take(10) {
+            println!("  {s}");
+        }
+    }
 }
 
 fn compare_one(bash: &Path, walker_bin: &Path, c: &str, scratch: &Path, t: &mut Tally) {
     reset_scratch(scratch);
     let Some((bash_out, bash_rc)) = run_one(bash, &["--norc", "-c", c], scratch, &[]) else {
         t.timeouts += 1;
+        if t.timeout_samples.len() < 10 {
+            t.timeout_samples.push(format!("[bash side] {}", trunc(c)));
+        }
         return;
     };
     reset_scratch(scratch);
@@ -205,6 +218,9 @@ fn compare_one(bash: &Path, walker_bin: &Path, c: &str, scratch: &Path, t: &mut 
         &[("BASH_WALKER_STATE", state_file.to_str().unwrap())],
     ) else {
         t.timeouts += 1;
+        if t.timeout_samples.len() < 10 {
+            t.timeout_samples.push(format!("[walker side] {}", trunc(c)));
+        }
         return;
     };
     if walker_out.contains("not supported by bash-walker") {
