@@ -48,3 +48,22 @@ impl Clock for RealClock {
 fn timeval_duration(tv: libc::timeval) -> Duration {
     Duration::new(tv.tv_sec.max(0) as u64, (tv.tv_usec.max(0) as u32) * 1000)
 }
+
+/// `$RANDOM`'s source, behind a seam so tests script it.
+pub trait Entropy {
+    /// A value in bash's `$RANDOM` range, 0..32768.
+    fn next_random(&self) -> u16;
+}
+
+#[derive(Default)]
+pub struct RealEntropy;
+
+impl Entropy for RealEntropy {
+    fn next_random(&self) -> u16 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        (nanos % 32768) as u16
+    }
+}

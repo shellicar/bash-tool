@@ -11,6 +11,7 @@ workspace = true
 # reimplementation. Grammar informed directly by reading GNU Bash 5.3's own
 # parse.y/command.h (~/repos/gnu/bash) — not a third-party port.
 [dependencies]
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

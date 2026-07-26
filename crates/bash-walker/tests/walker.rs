@@ -2,36 +2,32 @@
 //! subprocesses, asserting on the combined output and status — never on how
 //! the walker got there.
 //!
-//! The walker's cwd and exported env are process-global by design (one
-//! walker process per invocation in production), so every test serialises
-//! on one mutex and restores cwd afterwards.
+//! Cwd and env are shell STATE, not process state, so tests run in
+//! parallel with no mutex and no cwd restoration — that this file needs
+//! neither is itself evidence the process-global edges are gone.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
-use bash_walker::clock::{Clock, CpuTimes};
+use bash_walker::clock::{Clock, CpuTimes, Entropy};
 use bash_walker::ShellState;
 
-fn lock() -> MutexGuard<'static, ()> {
-    static M: OnceLock<Mutex<()>> = OnceLock::new();
+fn init() {
+    static ONCE: Once = Once::new();
     // Process substitution re-execs the walker binary; under cargo test the
     // current exe is the harness, so name the real binary explicitly.
-    // SAFETY: set under the same mutex every test holds.
-    unsafe { std::env::set_var("BASH_WALKER_SELF", env!("CARGO_BIN_EXE_bash-walker")) };
-    M.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+    // SAFETY: guarded by Once, before any test spawns children.
+    ONCE.call_once(|| unsafe {
+        std::env::set_var("BASH_WALKER_SELF", env!("CARGO_BIN_EXE_bash-walker"))
+    });
 }
 
-/// Run one script in a fresh state, cwd restored afterwards.
+/// Run one script in a fresh state.
 fn run(src: &str) -> (String, i32) {
-    let _guard = lock();
-    let saved = std::env::current_dir().unwrap();
+    init();
     let mut state = ShellState::default();
-    let r = bash_walker::run(src, &mut state);
-    std::env::set_current_dir(saved).unwrap();
-    r
+    bash_walker::run(src, &mut state)
 }
 
 /// A fake clock the test scripts by hand — `time` reads it instead of the
@@ -55,29 +51,44 @@ fn run_with_scripted_clock(
     wall: Vec<Duration>,
     cpu: Vec<CpuTimes>,
 ) -> (String, i32) {
-    let _guard = lock();
-    let saved = std::env::current_dir().unwrap();
+    init();
     let clock = Arc::new(ScriptedClock {
         wall: Mutex::new(wall.into()),
         cpu: Mutex::new(cpu.into()),
     });
     let mut state = ShellState::default();
-    let r = bash_walker::run_with_clock(src, &mut state, clock);
-    std::env::set_current_dir(saved).unwrap();
-    r
+    bash_walker::run_with_clock(src, &mut state, clock)
+}
+
+/// A scripted `$RANDOM` source.
+struct ScriptedEntropy(Mutex<VecDeque<u16>>);
+
+impl Entropy for ScriptedEntropy {
+    fn next_random(&self) -> u16 {
+        self.0.lock().unwrap().pop_front().expect("scripted random value")
+    }
+}
+
+fn run_with_scripted_entropy(src: &str, values: Vec<u16>) -> (String, i32) {
+    init();
+    let entropy = Arc::new(ScriptedEntropy(Mutex::new(values.into())));
+    let mut state = ShellState::default();
+    bash_walker::run_with(
+        src,
+        &mut state,
+        Arc::new(bash_walker::clock::RealClock::default()),
+        entropy,
+    )
 }
 
 /// Run scripts sequentially against ONE state — the persistence story.
 fn run_session(scripts: &[&str]) -> Vec<(String, i32)> {
-    let _guard = lock();
-    let saved = std::env::current_dir().unwrap();
+    init();
     let mut state = ShellState::default();
-    let out = scripts
+    scripts
         .iter()
         .map(|s| bash_walker::run(s, &mut state))
-        .collect();
-    std::env::set_current_dir(saved).unwrap();
-    out
+        .collect()
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -126,9 +137,48 @@ fn cwd_persists_across_invocations() {
     let results = run_session(&["cd /tmp", "pwd"]);
 
     assert_eq!(results[0].1, 0);
-    let expected = std::fs::canonicalize("/tmp").unwrap();
+    // Logical cwd, like bash: `cd /tmp; pwd` prints /tmp, not the
+    // symlink-resolved /private/tmp a physical chdir would report.
+    let expected = "/tmp";
     let actual = results[1].0.trim().to_string();
-    assert_eq!(actual, expected.to_string_lossy());
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn cd_is_shell_state_and_never_touches_the_process_cwd() {
+    let before = std::env::current_dir().unwrap();
+
+    let (output, status) = run("cd / && pwd");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "/\n");
+    let after = std::env::current_dir().unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn cd_normalizes_dot_dot_logically() {
+    let (output, _) = run("cd /usr/bin && cd ../lib && pwd");
+
+    let expected = "/usr/lib\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn random_comes_from_the_scripted_entropy_source() {
+    let expected = ("12345 671\n".to_string(), 0);
+
+    let actual = run_with_scripted_entropy("echo $RANDOM $RANDOM", vec![12345, 671]);
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn unset_environment_variable_does_not_reach_a_child() {
+    let (output, status) = run("export BW_UNSET_CHECK=here; unset BW_UNSET_CHECK; printenv BW_UNSET_CHECK; echo rc=$?");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "rc=1\n");
 }
 
 #[test]
@@ -631,6 +681,66 @@ fn process_substitution_sees_the_parent_shell_variables() {
 
     assert_eq!(status, 0);
     assert_eq!(output, "carried-in\n");
+}
+
+#[test]
+fn background_compound_runs_detached_and_wait_collects_it() {
+    let d = temp_dir("bg-compound");
+    let (_, status) = run(&format!(
+        "(cd {} && echo from-bg > out.txt) & wait",
+        d.display()
+    ));
+
+    assert_eq!(status, 0);
+    let expected = "from-bg\n";
+    let actual = std::fs::read_to_string(d.join("out.txt")).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn background_compound_survives_the_invocation() {
+    let d = temp_dir("bg-survive");
+    let f = d.join("late.txt");
+    let start = std::time::Instant::now();
+
+    let (_, status) = run(&format!("(sleep 0.4 && echo late > {}) &", f.display()));
+
+    assert_eq!(status, 0);
+    assert!(
+        start.elapsed() < Duration::from_millis(300),
+        "background job blocked the invocation"
+    );
+    assert!(!f.exists(), "job finished before the invocation returned");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !f.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let expected = "late\n";
+    let actual = std::fs::read_to_string(&f).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn background_compound_sets_a_real_pid_in_bang() {
+    let (output, status) = run("(true) & echo $!");
+
+    assert_eq!(status, 0);
+    let pid: u32 = output.trim().parse().expect("$! is a number");
+    assert!(pid > 0);
+}
+
+#[test]
+fn background_function_call_runs_in_the_job() {
+    let d = temp_dir("bg-fn");
+    let (_, status) = run(&format!(
+        "f() {{ echo fn-bg > {}/fn.txt; }}; f & wait",
+        d.display()
+    ));
+
+    assert_eq!(status, 0);
+    let expected = "fn-bg\n";
+    let actual = std::fs::read_to_string(d.join("fn.txt")).unwrap();
+    assert_eq!(actual, expected);
 }
 
 #[test]

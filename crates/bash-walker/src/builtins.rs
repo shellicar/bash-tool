@@ -29,8 +29,7 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
     match name {
         "cd" => cd(ex, ctx, args),
         "pwd" => {
-            let cwd = std::env::current_dir().map_err(|e| Flow::Fatal(e.to_string()))?;
-            ctx.write_out(&format!("{}\n", cwd.display()));
+            ctx.write_out(&format!("{}\n", ex.state.cwd.display()));
             Ok(0)
         }
         "export" => {
@@ -125,7 +124,7 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
                 ctx.write_err("bash-walker: source: filename argument required\n");
                 return Ok(2);
             };
-            let src = std::fs::read_to_string(path)
+            let src = std::fs::read_to_string(ex.state.resolve(path))
                 .map_err(|e| Flow::Fatal(format!("source {path}: {}", crate::walk::errmsg(&e))))?;
             let saved = if args.len() > 1 {
                 Some(std::mem::replace(&mut ex.state.positional, args[1..].to_vec()))
@@ -680,8 +679,9 @@ fn parse_status(arg: Option<&String>) -> i32 {
         .unwrap_or(0)
 }
 
+/// A mutation of the shell's cwd field — validated against the filesystem,
+/// but never chdir: the process cwd is not shell state.
 fn cd(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
-    let prev = std::env::current_dir().ok();
     let target = match args.first().map(String::as_str) {
         None => match ex.state.get_var("HOME") {
             Some(h) => h,
@@ -702,15 +702,18 @@ fn cd(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
         },
         Some(p) => p.to_string(),
     };
-    match std::env::set_current_dir(&target) {
-        Ok(()) => {
-            if let Some(prev) = prev {
-                ex.state.export_var("OLDPWD", Some(prev.to_string_lossy().into_owned()));
-            }
-            if let Ok(now) = std::env::current_dir() {
-                ex.state.export_var("PWD", Some(now.to_string_lossy().into_owned()));
-            }
+    let resolved = crate::state::normalize(&ex.state.resolve(&target));
+    match std::fs::metadata(&resolved) {
+        Ok(m) if m.is_dir() => {
+            let prev = ex.state.cwd.clone();
+            ex.state.export_var("OLDPWD", Some(prev.to_string_lossy().into_owned()));
+            ex.state.export_var("PWD", Some(resolved.to_string_lossy().into_owned()));
+            ex.state.cwd = resolved;
             Ok(0)
+        }
+        Ok(_) => {
+            ctx.write_err(&format!("bash-walker: cd: {target}: Not a directory\n"));
+            Ok(1)
         }
         Err(e) => {
             ctx.write_err(&format!("bash-walker: cd: {target}: {}\n", crate::walk::errmsg(&e)));
@@ -860,7 +863,7 @@ fn command(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
                 ctx.write_out(&format!("{name}\n"));
                 return Ok(0);
             }
-            match path_lookup(name) {
+            match path_lookup(ex, name) {
                 Some(p) => {
                     ctx.write_out(&format!("{p}\n"));
                     Ok(0)
@@ -875,11 +878,11 @@ fn command(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
     }
 }
 
-fn path_lookup(name: &str) -> Option<String> {
+fn path_lookup(ex: &Exec, name: &str) -> Option<String> {
     if name.contains('/') {
-        return std::fs::metadata(name).ok().map(|_| name.to_string());
+        return std::fs::metadata(ex.state.resolve(name)).ok().map(|_| name.to_string());
     }
-    let path = std::env::var("PATH").ok()?;
+    let path = ex.state.get_var("PATH")?;
     for dir in path.split(':') {
         let cand = std::path::Path::new(dir).join(name);
         if let Ok(md) = cand.metadata() {

@@ -31,8 +31,9 @@ pub fn eval(ex: &mut Exec, ctx: &Ctx, expr: &CondExpr) -> Result<bool, Flow> {
 
 fn eval_unary(ex: &mut Exec, ctx: &Ctx, op: &str, operand: &Word) -> Result<bool, Flow> {
     let v = expand::expand_single(ex, ctx, operand)?;
-    let meta = || std::fs::metadata(&v);
-    let lmeta = || std::fs::symlink_metadata(&v);
+    let path = ex.state.resolve(&v);
+    let meta = || std::fs::metadata(&path);
+    let lmeta = || std::fs::symlink_metadata(&path);
     Ok(match op {
         "-z" => v.is_empty(),
         "-n" => !v.is_empty(),
@@ -50,9 +51,9 @@ fn eval_unary(ex: &mut Exec, ctx: &Ctx, op: &str, operand: &Word) -> Result<bool
         "-g" => meta().map(|m| m.permissions().mode() & 0o2000 != 0).unwrap_or(false),
         "-u" => meta().map(|m| m.permissions().mode() & 0o4000 != 0).unwrap_or(false),
         // access(2) honors effective ids and ACLs — the same call bash makes.
-        "-r" => unsafe { access(&v, libc::R_OK) },
-        "-w" => unsafe { access(&v, libc::W_OK) },
-        "-x" => unsafe { access(&v, libc::X_OK) },
+        "-r" => unsafe { access(&path.to_string_lossy(), libc::R_OK) },
+        "-w" => unsafe { access(&path.to_string_lossy(), libc::W_OK) },
+        "-x" => unsafe { access(&path.to_string_lossy(), libc::X_OK) },
         "-O" => meta().map(|m| m.uid() == unsafe { libc::geteuid() }).unwrap_or(false),
         "-G" => meta().map(|m| m.gid() == unsafe { libc::getegid() }).unwrap_or(false),
         "-t" => v
@@ -132,8 +133,8 @@ fn eval_binary(
         }
         "-nt" | "-ot" | "-ef" => {
             let r = expand::expand_single(ex, ctx, right)?;
-            let lm = std::fs::metadata(&l);
-            let rm = std::fs::metadata(&r);
+            let lm = std::fs::metadata(ex.state.resolve(&l));
+            let rm = std::fs::metadata(ex.state.resolve(&r));
             match (op, lm, rm) {
                 ("-nt", Ok(a), Ok(b)) => {
                     a.modified().ok() > b.modified().ok()

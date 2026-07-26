@@ -65,7 +65,6 @@ impl Ctx {
 pub struct Shared {
     pub bg: Vec<Child>,
     pub procsub_temps: Vec<PathBuf>,
-    pub temp_counter: u64,
     pub func_depth: u32,
     pub loop_depth: u32,
     /// Status of the most recent command substitution — an assignment-only
@@ -76,6 +75,7 @@ pub struct Shared {
     /// stages save/restore it, so their `exec` does not leak out.
     pub persistent_ctx: Option<Ctx>,
     pub clock: Arc<dyn crate::clock::Clock>,
+    pub entropy: Arc<dyn crate::clock::Entropy>,
 }
 
 impl Default for Shared {
@@ -83,12 +83,12 @@ impl Default for Shared {
         Self {
             bg: Vec::new(),
             procsub_temps: Vec::new(),
-            temp_counter: 0,
             func_depth: 0,
             loop_depth: 0,
             last_capture_status: None,
             persistent_ctx: None,
             clock: Arc::new(crate::clock::RealClock::default()),
+            entropy: Arc::new(crate::clock::RealEntropy),
         }
     }
 }
@@ -103,13 +103,14 @@ const DECL_BUILTINS: &[&str] = &["export", "local", "declare", "readonly", "type
 impl<'a> Exec<'a> {
     /// An anonymous temp file: created then immediately unlinked, alive only
     /// through its handle — capture buffers and heredoc feeds need no
-    /// cleanup pass.
+    /// cleanup pass. The counter is process-wide: multiple walkers can
+    /// coexist in one process (parallel tests), so pid alone is not unique.
     pub fn anon_temp(&mut self) -> Result<File, Flow> {
-        self.shared.temp_counter += 1;
+        let n = unique_id();
         let path = std::env::temp_dir().join(format!(
             "bash-walker-{}-{}",
             std::process::id(),
-            self.shared.temp_counter
+            n
         ));
         let f = std::fs::OpenOptions::new()
             .read(true)
@@ -276,7 +277,7 @@ impl<'a> Exec<'a> {
             let last = i + 1 == n;
             let stage_stdin = if i == 0 { ctx.stdin.clone() } else { next_stdin.take() };
 
-            let saved_cwd = std::env::current_dir().ok();
+            // A stage is a subshell: cloned state, so its cd/vars stay its own.
             let mut stage_state = self.state.clone();
             let mut sub = Exec { state: &mut stage_state, shared: &mut *self.shared };
 
@@ -294,9 +295,6 @@ impl<'a> Exec<'a> {
                                 if !last {
                                     let empty = sub.anon_temp()?;
                                     next_stdin = Some(Arc::new(empty));
-                                }
-                                if let Some(c) = saved_cwd {
-                                    let _ = std::env::set_current_dir(c);
                                 }
                                 continue;
                             }
@@ -327,9 +325,6 @@ impl<'a> Exec<'a> {
                                     next_stdin = Some(Arc::new(empty));
                                 }
                             }
-                        }
-                        if let Some(c) = saved_cwd {
-                            let _ = std::env::set_current_dir(c);
                         }
                         continue;
                     }
@@ -363,9 +358,6 @@ impl<'a> Exec<'a> {
                 let _ = h.seek(SeekFrom::Start(0));
                 next_stdin = Some(Arc::new(h));
             }
-            if let Some(c) = saved_cwd {
-                let _ = std::env::set_current_dir(c);
-            }
         }
 
         for (i, slot) in waiting.iter_mut().enumerate() {
@@ -391,16 +383,12 @@ impl<'a> Exec<'a> {
     }
 
     fn run_subshell(&mut self, inner: &Command, ctx: &Ctx, tested: bool) -> Result<i32, Flow> {
-        let saved_cwd = std::env::current_dir().ok();
         let saved_pctx = self.shared.persistent_ctx.clone();
         let mut sub_state = self.state.clone();
         let mut sub = Exec { state: &mut sub_state, shared: &mut *self.shared };
         let r = sub.exec(inner, ctx, tested);
         let capture_status = sub_state.last_status;
         self.shared.persistent_ctx = saved_pctx;
-        if let Some(c) = saved_cwd {
-            let _ = std::env::set_current_dir(c);
-        }
         match r {
             Ok(st) => Ok(st),
             Err(Flow::Exit(st)) => Ok(st),
@@ -550,20 +538,28 @@ impl<'a> Exec<'a> {
     }
 
     fn exec_background(&mut self, inner: &Command, ctx: &Ctx) -> Result<i32, Flow> {
+        // Fast path: a pipeline of external simple commands spawns directly.
+        // Anything else — compounds, builtins, functions — becomes a child
+        // walker running the subtree: a real process, so the job outlives
+        // this invocation exactly as bash's forked subshell would.
         let mut stages = Vec::new();
         flatten_pipeline(inner, &mut stages);
+        let all_external_simples = stages.iter().all(|s| match s {
+            Command::Simple(sc) => sc.program.as_ref().is_some_and(|p| {
+                !self.state.funcs.contains_key(&p.text) && !builtins::is_builtin(&p.text)
+            }),
+            _ => false,
+        });
+        if !all_external_simples {
+            return self.spawn_background_job(inner, ctx);
+        }
         let mut simples = Vec::new();
         for s in &stages {
             match s {
                 Command::Simple(sc) => simples.push(sc),
-                _ => {
-                    return Err(Flow::Fatal(
-                        "backgrounding a compound command is not supported by bash-walker".into(),
-                    ))
-                }
+                _ => unreachable!("checked all stages are simple"),
             }
         }
-        let saved_cwd = std::env::current_dir().ok();
         let mut bg_state = self.state.clone();
         let mut sub = Exec { state: &mut bg_state, shared: &mut *self.shared };
         let n = simples.len();
@@ -604,10 +600,39 @@ impl<'a> Exec<'a> {
                 }
             }
         }
-        if let Some(c) = saved_cwd {
-            let _ = std::env::set_current_dir(c);
-        }
         self.state.last_background_pid = last_pid;
+        Ok(0)
+    }
+
+    /// Fork, in spawn form: a child walker executes the subtree with a copy
+    /// of the shell state, detached. `$!` is its real pid, so `wait` and
+    /// `kill` behave exactly as under bash.
+    fn spawn_background_job(&mut self, inner: &Command, ctx: &Ctx) -> Result<i32, Flow> {
+        let job = crate::BackgroundJob {
+            command: inner.clone(),
+            funcs: self.state.funcs.clone(),
+            vars: self.state.vars.clone(),
+            cwd: self.state.cwd.clone(),
+        };
+        let payload = serde_json::to_string(&job)
+            .map_err(|e| Flow::Fatal(format!("background job: {e}")))?;
+        let mut cmd = Proc::new(walker_exe());
+        cmd.arg("--ast-stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(
+                ctx.stdout.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?,
+            ))
+            .stderr(Stdio::from(
+                ctx.stderr.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?,
+            ));
+        let mut ch = cmd
+            .spawn()
+            .map_err(|e| Flow::Fatal(format!("background job: {}", errmsg(&e))))?;
+        if let Some(mut stdin) = ch.stdin.take() {
+            let _ = stdin.write_all(payload.as_bytes());
+        }
+        self.state.last_background_pid = Some(ch.id());
+        self.shared.bg.push(ch);
         Ok(0)
     }
 
@@ -783,6 +808,12 @@ impl<'a> Exec<'a> {
     ) -> Result<SpawnSlot, Flow> {
         let mut cmd = Proc::new(&fields[0]);
         cmd.args(&fields[1..]);
+        // The child's world is built from shell state, not inherited: cwd
+        // from the state's cwd, environment from the exported vars (the
+        // process env is a stale birth snapshot, never consulted).
+        cmd.current_dir(&self.state.cwd);
+        cmd.env_clear();
+        cmd.envs(self.state.child_env());
         for (k, v) in assigns {
             cmd.env(k, v);
         }
@@ -853,7 +884,7 @@ impl<'a> Exec<'a> {
                         .write(true)
                         .append(r.op == RedirectOp::Append)
                         .truncate(r.op == RedirectOp::Out)
-                        .open(&path)
+                        .open(self.state.resolve(&path))
                         .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
                     match r.fd {
                         None | Some(1) => c.stdout = Arc::new(f),
@@ -870,7 +901,7 @@ impl<'a> Exec<'a> {
                         .write(true)
                         .append(r.op == RedirectOp::AppendOutErr)
                         .truncate(r.op == RedirectOp::OutErr)
-                        .open(&path)
+                        .open(self.state.resolve(&path))
                         .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
                     let f = Arc::new(f);
                     c.stdout = Arc::clone(&f);
@@ -878,7 +909,7 @@ impl<'a> Exec<'a> {
                 }
                 RedirectOp::In => {
                     let path = expand::expand_redirect_target(self, &c, &r.target)?;
-                    let f = File::open(&path)
+                    let f = File::open(self.state.resolve(&path))
                         .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
                     c.stdin = Some(Arc::new(f));
                 }
@@ -919,7 +950,7 @@ impl<'a> Exec<'a> {
                                 .create(true)
                                 .write(true)
                                 .truncate(true)
-                                .open(path)
+                                .open(self.state.resolve(path))
                                 .map_err(|e| Flow::Fatal(format!("{path}: {e}")))?;
                             let f = Arc::new(f);
                             c.stdout = Arc::clone(&f);
@@ -1004,6 +1035,11 @@ fn errexit_eligible(cmd: &Command) -> bool {
     )
 }
 
+fn unique_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// bash's `time` interval shape: `1m2.345s`.
 fn fmt_interval(d: std::time::Duration) -> String {
     let secs = d.as_secs_f64();
@@ -1048,7 +1084,6 @@ pub fn run_source(ex: &mut Exec, ctx: &Ctx, src: &str, tested: bool) -> Result<i
 pub fn run_capture(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> {
     let capture = ex.anon_temp()?;
     let handle = capture.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?;
-    let saved_cwd = std::env::current_dir().ok();
     let saved_pctx = ex.shared.persistent_ctx.clone();
     let mut sub_state = ex.state.clone();
     let status = {
@@ -1067,9 +1102,6 @@ pub fn run_capture(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> 
         }
     };
     ex.shared.persistent_ctx = saved_pctx;
-    if let Some(c) = saved_cwd {
-        let _ = std::env::set_current_dir(c);
-    }
     ex.state.last_status = status;
     ex.shared.last_capture_status = Some(status);
     let mut out = String::new();
@@ -1089,8 +1121,7 @@ pub fn run_capture(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> 
 /// infinite producers behave correctly. The child inherits the full shell
 /// state (cwd + variables) via a throwaway state file.
 pub fn run_procsub(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> {
-    ex.shared.temp_counter += 1;
-    let tag = format!("{}-{}", std::process::id(), ex.shared.temp_counter);
+    let tag = format!("{}-{}", std::process::id(), unique_id());
     let fifo = std::env::temp_dir().join(format!("bash-walker-procsub-{tag}"));
     let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes().to_vec())
         .map_err(|e| Flow::Fatal(format!("procsub path: {e}")))?;

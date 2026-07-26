@@ -4,7 +4,7 @@
 //! docs/ast-execution.md, "AST node shape"). Redirects thread through every
 //! variant, attached after the fact, same as bash's own grammar actions.
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Word {
     /// The literal text as bash's parser saw it. `$(...)`/`` ` ` ``/`${...}`/
     /// `((...))` interiors are NOT resolved here — they stay as raw, opaque
@@ -16,7 +16,7 @@ pub struct Word {
     pub quoted: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Connector {
     And,      // &&
     Or,       // ||
@@ -25,7 +25,7 @@ pub enum Connector {
     Pipe,     // |
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RedirectOp {
     // The corpus-scoped forms (docs/ast-execution.md feature-prevalence
     // table). Bash's real grammar has 19 r_instruction variants; still
@@ -42,7 +42,7 @@ pub enum RedirectOp {
     HereString,   // <<<
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Redirect {
     pub op: RedirectOp,
     pub fd: Option<u32>,
@@ -53,7 +53,7 @@ pub struct Redirect {
     pub heredoc_body: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SimpleCommand {
     /// Leading `VAR=val` assignments before the program name (parse.y's
     /// `clean_simple_command()` split). Real bash allows a bare assignment
@@ -67,7 +67,7 @@ pub struct SimpleCommand {
     pub redirects: Vec<Redirect>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Connection {
     pub left: Box<Command>,
     pub right: Box<Command>,
@@ -78,7 +78,7 @@ pub struct Connection {
 /// `cond_and`/`cond_term`) — a small separate recursive-descent parser in
 /// real bash, not part of the bison rules. Mirrored here as its own node
 /// family rather than folded into `Command`, matching bash's own separation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CondExpr {
     Or(Box<CondExpr>, Box<CondExpr>),
     And(Box<CondExpr>, Box<CondExpr>),
@@ -97,7 +97,7 @@ pub enum CondExpr {
     Term(Word),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ForCommand {
     pub var: String,
     /// Empty means the `for x; do` form — bash iterates over `"$@"`.
@@ -105,7 +105,7 @@ pub struct ForCommand {
     pub body: Box<Command>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IfCommand {
     /// (condition, then-branch) pairs — the first is `if`, the rest are
     /// `elif`. `else`'s body, if present, is `else_branch`.
@@ -113,7 +113,7 @@ pub struct IfCommand {
     pub else_branch: Option<Box<Command>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaseArm {
     pub patterns: Vec<Word>,
     pub body: Option<Box<Command>>,
@@ -122,20 +122,20 @@ pub struct CaseArm {
     pub terminator: CaseTerminator,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CaseTerminator {
     Stop,
     Fallthrough,
     TestNext,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaseCommand {
     pub word: Word,
     pub arms: Vec<CaseArm>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     Simple(SimpleCommand),
     Connection(Connection),

@@ -43,6 +43,36 @@ fn main() {
         None => bash_walker::ShellState::default(),
     };
 
+    // Background-job child mode: the parent hands the exact AST subtree and
+    // shell state on stdin; output streams to the inherited fds. This
+    // process IS the background job — a real pid, orphan-safe, like bash's
+    // fork.
+    if args.first().is_some_and(|a| a == "--ast-stdin") {
+        let mut input = String::new();
+        if std::io::stdin().read_to_string(&mut input).is_err() {
+            eprintln!("bash-walker: failed to read job from stdin");
+            std::process::exit(2);
+        }
+        let job: bash_walker::BackgroundJob = match serde_json::from_str(&input) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("bash-walker: bad job payload: {e}");
+                std::process::exit(2);
+            }
+        };
+        let (out, err) = {
+            use std::os::fd::FromRawFd;
+            // SAFETY: dup yields fresh fds we own.
+            unsafe {
+                (
+                    std::fs::File::from_raw_fd(libc::dup(1)),
+                    std::fs::File::from_raw_fd(libc::dup(2)),
+                )
+            }
+        };
+        std::process::exit(bash_walker::run_background_job(job, out, err));
+    }
+
     // Process-substitution child mode: open the FIFO ourselves (write-only,
     // blocking until the consumer opens the read side — bash's own dance)
     // and stream output straight through, so early-exit consumers and

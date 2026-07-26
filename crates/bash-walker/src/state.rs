@@ -43,7 +43,7 @@ pub struct Flags {
     pub pipefail: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ShellState {
     pub vars: HashMap<String, Var>,
     /// Innermost-last stack of `local` scopes; a function call pushes one.
@@ -55,27 +55,53 @@ pub struct ShellState {
     pub last_background_pid: Option<u32>,
     /// `[[ =~ ]]`'s capture groups: whole match at 0, groups after.
     pub rematch: Vec<String>,
+    /// The shell's working directory — state threaded to every use site
+    /// (spawns, redirects, globs, file tests), never the process cwd.
+    /// `cd` is a mutation of this field; nothing ever calls chdir.
+    pub cwd: PathBuf,
+}
+
+impl Default for ShellState {
+    /// The composition root: the ambient environment and process cwd are
+    /// read exactly once, here, into plain data. Every later read goes
+    /// through the state.
+    fn default() -> Self {
+        let mut vars: HashMap<String, Var> = std::env::vars()
+            .map(|(k, v)| (k, Var { value: v, exported: true }))
+            .collect();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        vars.insert(
+            "PWD".to_string(),
+            Var { value: cwd.to_string_lossy().into_owned(), exported: true },
+        );
+        Self {
+            vars,
+            locals: Vec::new(),
+            funcs: HashMap::new(),
+            positional: Vec::new(),
+            flags: Flags::default(),
+            last_status: 0,
+            last_background_pid: None,
+            rematch: Vec::new(),
+            cwd,
+        }
+    }
 }
 
 impl ShellState {
-    /// Variable lookup: innermost local scope first, then shell vars, then
-    /// the process environment (the container's own env — HOME, PATH, ...).
+    /// Variable lookup: innermost local scope first, then shell vars (which
+    /// include the environment snapshot taken at birth).
     pub fn get_var(&self, name: &str) -> Option<String> {
         for scope in self.locals.iter().rev() {
             if let Some(v) = scope.get(name) {
                 return Some(v.value.clone());
             }
         }
-        if let Some(v) = self.vars.get(name) {
-            return Some(v.value.clone());
-        }
-        std::env::var(name).ok()
+        self.vars.get(name).map(|v| v.value.clone())
     }
 
     /// Assignment: an existing `local` in any active scope wins, otherwise
-    /// the shell var (keeping its exported flag). An exported var's new
-    /// value is pushed into the process env immediately so child PATH
-    /// lookups and inheritance see it without per-spawn merging.
+    /// the shell var (keeping its exported flag).
     pub fn set_var(&mut self, name: &str, value: String) {
         for scope in self.locals.iter_mut().rev() {
             if let Some(v) = scope.get_mut(name) {
@@ -83,12 +109,7 @@ impl ShellState {
                 return;
             }
         }
-        let exported = self.vars.get(name).is_some_and(|v| v.exported)
-            || std::env::var_os(name).is_some();
-        if exported {
-            // SAFETY: the walker is single-threaded.
-            unsafe { std::env::set_var(name, &value) };
-        }
+        let exported = self.vars.get(name).is_some_and(|v| v.exported);
         self.vars.insert(name.to_string(), Var { value, exported });
     }
 
@@ -96,8 +117,6 @@ impl ShellState {
         let value = value
             .or_else(|| self.get_var(name))
             .unwrap_or_default();
-        // SAFETY: the walker is single-threaded.
-        unsafe { std::env::set_var(name, &value) };
         self.vars.insert(name.to_string(), Var { value, exported: true });
     }
 
@@ -108,8 +127,6 @@ impl ShellState {
             }
         }
         self.vars.remove(name);
-        // SAFETY: the walker is single-threaded.
-        unsafe { std::env::remove_var(name) };
     }
 
     pub fn declare_local(&mut self, name: &str, value: Option<String>) {
@@ -120,6 +137,48 @@ impl ShellState {
             );
         }
     }
+
+    /// A relative path resolves against the shell's cwd; absolute passes
+    /// through.
+    pub fn resolve(&self, path: &str) -> PathBuf {
+        let p = Path::new(path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.cwd.join(p)
+        }
+    }
+
+    /// The environment a child process receives: the exported vars, built
+    /// fresh per spawn — nothing leaks in from the (stale) process env.
+    pub fn child_env(&self) -> Vec<(String, String)> {
+        self.vars
+            .iter()
+            .filter(|(_, v)| v.exported)
+            .map(|(k, v)| (k.clone(), v.value.clone()))
+            .collect()
+    }
+}
+
+/// Logical path normalisation — bash's default `cd` semantics: `.` drops,
+/// `..` pops textually (no symlink resolution, no filesystem access).
+pub fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("/");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push("/");
+    }
+    out
 }
 
 /// What crosses invocations. `CwdOnly` matches Claude Code's semantics
@@ -143,22 +202,17 @@ pub fn load_mode(path: &Path, mode: Persist) -> ShellState {
     if mode == Persist::CwdOnly {
         persisted.vars.clear();
     }
-    if let Some(cwd) = &persisted.cwd {
-        // Restore the working directory for real: the process cwd is the
-        // single source of truth during a run (globs, relative redirects,
-        // and spawned children all read it), state.cwd only carries it
-        // across invocations.
-        let _ = std::env::set_current_dir(cwd);
-        // SAFETY: called at startup, before any threads exist.
-        unsafe { std::env::set_var("PWD", cwd) };
+    let mut state = ShellState::default();
+    for (name, var) in persisted.vars {
+        state.vars.insert(name, var);
     }
-    for (name, var) in &persisted.vars {
-        if var.exported {
-            // SAFETY: called at startup, before any threads exist.
-            unsafe { std::env::set_var(name, &var.value) };
-        }
+    if let Some(cwd) = persisted.cwd {
+        state
+            .vars
+            .insert("PWD".to_string(), Var { value: cwd.to_string_lossy().into_owned(), exported: true });
+        state.cwd = cwd;
     }
-    ShellState { vars: persisted.vars, ..Default::default() }
+    state
 }
 
 pub fn save(path: &Path, state: &ShellState) -> std::io::Result<()> {
@@ -167,7 +221,7 @@ pub fn save(path: &Path, state: &ShellState) -> std::io::Result<()> {
 
 pub fn save_mode(path: &Path, state: &ShellState, mode: Persist) -> std::io::Result<()> {
     let persisted = PersistedState {
-        cwd: std::env::current_dir().ok(),
+        cwd: Some(state.cwd.clone()),
         vars: if mode == Persist::CwdOnly {
             Default::default()
         } else {

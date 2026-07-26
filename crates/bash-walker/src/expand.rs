@@ -30,7 +30,8 @@ pub fn expand_fields(ex: &mut Exec, ctx: &Ctx, words: &[Word]) -> Result<Vec<Str
     for word in words {
         for raw in brace_expand(&word.text) {
             let items = expand_items(ex, ctx, &raw, true)?;
-            assemble(&mut fields, items, true);
+            let cwd = ex.state.cwd.clone();
+            assemble(&mut fields, items, true, &cwd);
         }
     }
     Ok(fields)
@@ -144,7 +145,7 @@ pub fn expand_textual(ex: &mut Exec, ctx: &Ctx, raw: &str) -> Result<String, Flo
 /// Field assembly: concatenate items into fields at the breaks, apply the
 /// empty-field rules, then pathname-expand fields that still carry live
 /// glob metacharacters.
-fn assemble(fields: &mut Vec<String>, items: Vec<Item>, do_glob: bool) {
+fn assemble(fields: &mut Vec<String>, items: Vec<Item>, do_glob: bool, cwd: &std::path::Path) {
     let mut text = String::new();
     let mut pattern = String::new();
     let mut has_quoted = false;
@@ -160,7 +161,7 @@ fn assemble(fields: &mut Vec<String>, items: Vec<Item>, do_glob: bool) {
                       unconditional: bool| {
         if !text.is_empty() || *has_quoted || unconditional {
             if do_glob && *has_live_glob {
-                fields.extend(glob_field(text, pattern));
+                fields.extend(glob_field(text, pattern, cwd));
             } else {
                 fields.push(std::mem::take(text));
             }
@@ -202,18 +203,34 @@ fn assemble(fields: &mut Vec<String>, items: Vec<Item>, do_glob: bool) {
 }
 
 /// Pathname expansion for one field. No match leaves the word as-is (bash
-/// with nullglob off); results come back sorted from the glob crate.
-fn glob_field(text: &str, pattern: &str) -> Vec<String> {
+/// with nullglob off); results come back sorted from the glob crate. A
+/// relative pattern resolves against the SHELL's cwd (state, not process):
+/// the cwd is prefixed escaped for the walk, then stripped from results so
+/// output stays relative, as typed.
+fn glob_field(text: &str, pattern: &str, cwd: &std::path::Path) -> Vec<String> {
     let options = glob::MatchOptions {
         case_sensitive: true,
         require_literal_separator: true,
         require_literal_leading_dot: true,
     };
-    match glob::glob_with(pattern, options) {
+    let relative = !pattern.starts_with('/');
+    let full_pattern = if relative {
+        format!("{}/{}", glob::Pattern::escape(&cwd.to_string_lossy()), pattern)
+    } else {
+        pattern.to_string()
+    };
+    match glob::glob_with(&full_pattern, options) {
         Ok(paths) => {
             let matches: Vec<String> = paths
                 .filter_map(Result::ok)
-                .map(|p: PathBuf| p.to_string_lossy().into_owned())
+                .map(|p: PathBuf| {
+                    if relative {
+                        p.strip_prefix(cwd).map(|r| r.to_path_buf()).unwrap_or(p)
+                    } else {
+                        p
+                    }
+                })
+                .map(|p| p.to_string_lossy().into_owned())
                 .collect();
             if matches.is_empty() {
                 vec![text.to_string()]
@@ -819,13 +836,7 @@ fn param_value(ex: &mut Exec, name: &str) -> Result<Expanded, Flow> {
                 ex.state.positional.get(n - 1).cloned()
             }
         }
-        "RANDOM" => {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            Some((nanos % 32768).to_string())
-        }
+        "RANDOM" => Some(ex.shared.entropy.next_random().to_string()),
         _ => ex.state.get_var(name),
     };
     match v {
