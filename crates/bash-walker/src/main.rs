@@ -43,6 +43,39 @@ fn main() {
         None => bash_walker::ShellState::default(),
     };
 
+    // Process-substitution child mode: open the FIFO ourselves (write-only,
+    // blocking until the consumer opens the read side — bash's own dance)
+    // and stream output straight through, so early-exit consumers and
+    // SIGPIPE behave exactly as under bash.
+    if args.first().is_some_and(|a| a == "--stdout-path") {
+        let (Some(p), Some(c_flag), Some(script)) = (args.get(1), args.get(2), args.get(3))
+        else {
+            eprintln!("bash-walker: --stdout-path requires <path> -c <script>");
+            std::process::exit(2);
+        };
+        if c_flag != "-c" {
+            eprintln!("bash-walker: --stdout-path requires <path> -c <script>");
+            std::process::exit(2);
+        }
+        let out = match std::fs::OpenOptions::new().write(true).open(p) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("bash-walker: {p}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let err = {
+            use std::os::fd::FromRawFd;
+            // SAFETY: dup(2) yields a fresh fd we own.
+            unsafe { std::fs::File::from_raw_fd(libc::dup(2)) }
+        };
+        let status = bash_walker::run_streaming(script, &mut state, out, err);
+        if let Some(p) = &path {
+            let _ = bash_walker::state::save_mode(p, &state, mode);
+        }
+        std::process::exit(status);
+    }
+
     let (command, direct) = match args.first().map(String::as_str) {
         Some("-c") => match args.get(1) {
             Some(c) => (c.clone(), true),

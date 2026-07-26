@@ -7,6 +7,7 @@
 
 pub mod arith;
 pub mod builtins;
+pub mod clock;
 pub mod cond;
 pub mod expand;
 pub mod state;
@@ -21,7 +22,17 @@ use walk::{Ctx, Exec, Flow, Shared};
 /// Run one bash script against the state. Returns (combined stdout+stderr,
 /// exit status) — the contract exec_docker.py expects.
 pub fn run(src: &str, state: &mut ShellState) -> (String, i32) {
-    let mut shared = Shared::default();
+    run_with_clock(src, state, Arc::new(clock::RealClock::default()))
+}
+
+/// Same, with the `time` keyword's time sources injected — tests hand in a
+/// scripted clock instead of trusting the real one.
+pub fn run_with_clock(
+    src: &str,
+    state: &mut ShellState,
+    clk: Arc<dyn clock::Clock>,
+) -> (String, i32) {
+    let mut shared = Shared { clock: clk, ..Shared::default() };
     let mut ex = Exec { state, shared: &mut shared };
     let capture = match ex.anon_temp() {
         Ok(f) => f,
@@ -32,7 +43,13 @@ pub fn run(src: &str, state: &mut ShellState) -> (String, i32) {
         Err(e) => return (format!("bash-walker: {e}"), 1),
     };
     let out = Arc::new(capture);
-    let ctx = Ctx { stdin: None, stdout: Arc::clone(&out), stderr: out };
+    let ctx = Ctx {
+        stdin: None,
+        stdout: Arc::clone(&out),
+        stderr: out,
+        fds: std::collections::HashMap::new(),
+        derived: false,
+    };
 
     let status = match walk::run_source(&mut ex, &ctx, src, false) {
         Ok(st) => st,
@@ -59,4 +76,42 @@ pub fn run(src: &str, state: &mut ShellState) -> (String, i32) {
     let _ = read_handle.seek(SeekFrom::Start(0));
     let _ = read_handle.read_to_string(&mut output);
     (output, status)
+}
+
+/// Run with output flowing straight to the given handles instead of a
+/// capture buffer — the process-substitution child, where the consumer
+/// reads concurrently and buffering would defeat streaming (and SIGPIPE).
+pub fn run_streaming(
+    src: &str,
+    state: &mut ShellState,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+) -> i32 {
+    let mut shared = Shared::default();
+    let mut ex = Exec { state, shared: &mut shared };
+    let ctx = Ctx {
+        stdin: None,
+        stdout: Arc::new(stdout),
+        stderr: Arc::new(stderr),
+        fds: std::collections::HashMap::new(),
+        derived: false,
+    };
+    let status = match walk::run_source(&mut ex, &ctx, src, false) {
+        Ok(st) => st,
+        Err(Flow::Exit(st)) => st,
+        Err(Flow::Return(st)) => st,
+        Err(Flow::Break(_)) | Err(Flow::Continue(_)) => 0,
+        Err(Flow::Fatal(msg)) | Err(Flow::RedirectFailed(msg)) => {
+            ctx.write_err(&format!("bash-walker: {msg}\n"));
+            if msg.starts_with("syntax error") {
+                2
+            } else {
+                1
+            }
+        }
+    };
+    for path in shared.procsub_temps.drain(..) {
+        let _ = std::fs::remove_file(path);
+    }
+    status
 }

@@ -12,11 +12,11 @@ use crate::walk::{Ctx, Exec, Flow};
 const NATIVE: &[&str] = &[
     "cd", "pwd", "export", "unset", "local", "exit", "return", "break", "continue", "shift",
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
-    "echo", "printf",
+    "echo", "printf", "exec",
 ];
 
 const UNSUPPORTED: &[&str] = &[
-    "declare", "typeset", "readonly", "alias", "unalias", "trap", "getopts", "exec", "ulimit",
+    "declare", "typeset", "readonly", "alias", "unalias", "trap", "getopts", "ulimit",
     "jobs", "fg", "bg", "hash", "type", "help", "history", "disown", "suspend", "times",
     "builtin", "caller", "enable", "pushd", "popd", "dirs", "umask", "mapfile", "readarray",
 ];
@@ -149,6 +149,21 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
         "echo" => echo(ctx, args),
         "printf" => printf(ex, ctx, args),
         "command" => command(ex, ctx, args),
+        // `exec` with only redirects rewires the shell itself for the rest
+        // of the invocation (the redirects were already applied into this
+        // ctx); with a command it replaces the shell: run it, then the
+        // shell exits with its status.
+        "exec" => {
+            if args.is_empty() {
+                let mut c = ctx.clone();
+                c.derived = false;
+                ex.shared.persistent_ctx = Some(c);
+                Ok(0)
+            } else {
+                let st = ex.run_external_wait(args, ctx)?;
+                Err(Flow::Exit(st))
+            }
+        }
         "let" => {
             let mut v = 0;
             for a in args {

@@ -6,12 +6,19 @@
 //! walker process per invocation in production), so every test serialises
 //! on one mutex and restores cwd afterwards.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
+use bash_walker::clock::{Clock, CpuTimes};
 use bash_walker::ShellState;
 
 fn lock() -> MutexGuard<'static, ()> {
     static M: OnceLock<Mutex<()>> = OnceLock::new();
+    // Process substitution re-execs the walker binary; under cargo test the
+    // current exe is the harness, so name the real binary explicitly.
+    // SAFETY: set under the same mutex every test holds.
+    unsafe { std::env::set_var("BASH_WALKER_SELF", env!("CARGO_BIN_EXE_bash-walker")) };
     M.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -23,6 +30,39 @@ fn run(src: &str) -> (String, i32) {
     let saved = std::env::current_dir().unwrap();
     let mut state = ShellState::default();
     let r = bash_walker::run(src, &mut state);
+    std::env::set_current_dir(saved).unwrap();
+    r
+}
+
+/// A fake clock the test scripts by hand — `time` reads it instead of the
+/// real clock, so timing output is asserted exactly, never by luck.
+struct ScriptedClock {
+    wall: Mutex<VecDeque<Duration>>,
+    cpu: Mutex<VecDeque<CpuTimes>>,
+}
+
+impl Clock for ScriptedClock {
+    fn now_monotonic(&self) -> Duration {
+        self.wall.lock().unwrap().pop_front().expect("scripted wall reading")
+    }
+    fn cpu_times(&self) -> CpuTimes {
+        self.cpu.lock().unwrap().pop_front().expect("scripted cpu reading")
+    }
+}
+
+fn run_with_scripted_clock(
+    src: &str,
+    wall: Vec<Duration>,
+    cpu: Vec<CpuTimes>,
+) -> (String, i32) {
+    let _guard = lock();
+    let saved = std::env::current_dir().unwrap();
+    let clock = Arc::new(ScriptedClock {
+        wall: Mutex::new(wall.into()),
+        cpu: Mutex::new(cpu.into()),
+    });
+    let mut state = ShellState::default();
+    let r = bash_walker::run_with_clock(src, &mut state, clock);
     std::env::set_current_dir(saved).unwrap();
     r
 }
@@ -487,6 +527,110 @@ fn backslash_in_heredoc_body_expands_and_terminates() {
 
     assert_eq!(status, 0);
     assert_eq!(output, "a\\|b\n");
+}
+
+#[test]
+fn time_reports_scripted_wall_and_cpu_intervals() {
+    let wall = vec![Duration::ZERO, Duration::from_millis(1234)];
+    let cpu = vec![
+        CpuTimes::default(),
+        CpuTimes { user: Duration::from_millis(500), sys: Duration::from_millis(250) },
+    ];
+
+    let expected = ("\nreal\t0m1.234s\nuser\t0m0.500s\nsys\t0m0.250s\n".to_string(), 0);
+
+    let actual = run_with_scripted_clock("time true", wall, cpu);
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn time_reports_minutes_past_sixty_seconds() {
+    let wall = vec![Duration::ZERO, Duration::from_millis(75_500)];
+    let cpu = vec![CpuTimes::default(), CpuTimes::default()];
+
+    let (output, _) = run_with_scripted_clock("time true", wall, cpu);
+
+    let expected = "\nreal\t1m15.500s\nuser\t0m0.000s\nsys\t0m0.000s\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn exec_redirect_rewires_the_shell_for_later_commands() {
+    let (output, status) = run("exec 2>/dev/null\nls /definitely-does-not-exist-bw\necho after");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "after\n");
+}
+
+#[test]
+fn exec_opens_fd_three_and_a_later_dup_writes_through_it() {
+    let (output, status) = run("exec 3>&1 && echo through-three >&3");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "through-three\n");
+}
+
+#[test]
+fn exec_in_a_subshell_does_not_leak_out() {
+    let (output, status) = run("(exec 1>/dev/null; echo hidden); echo visible");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "visible\n");
+}
+
+#[test]
+fn exec_with_a_command_replaces_the_shell() {
+    let (output, status) = run("exec echo replaced\necho never-runs");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "replaced\n");
+}
+
+#[test]
+fn exec_command_not_found_exits_127() {
+    let (_, status) = run("exec definitely-not-a-command-bw-2026");
+
+    assert_eq!(status, 127);
+}
+
+#[test]
+fn fd_three_redirect_reaches_a_child_process() {
+    let d = temp_dir("fd3");
+    let f = d.join("three.txt");
+    let (_, status) = run(&format!("sh -c 'echo from-child >&3' 3>{}", f.display()));
+
+    assert_eq!(status, 0);
+    let expected = "from-child\n";
+    let actual = std::fs::read_to_string(&f).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn dup_of_an_unopened_fd_fails_the_command_not_the_script() {
+    let (output, status) = run("echo x >&7; echo after $?");
+
+    assert_eq!(status, 0);
+    assert!(output.contains("Bad file descriptor"), "output: {output:?}");
+    assert!(output.contains("after 1"), "output: {output:?}");
+}
+
+#[test]
+fn process_substitution_streams_to_an_early_exiting_consumer() {
+    // A temp-file implementation would try to materialise a billion lines;
+    // a real FIFO lets head take one line and the producer die on SIGPIPE.
+    let (output, status) = run("head -1 <(seq 1 1000000000)");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "1\n");
+}
+
+#[test]
+fn process_substitution_sees_the_parent_shell_variables() {
+    let (output, status) = run("x=carried-in; cat <(echo $x)");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "carried-in\n");
 }
 
 #[test]

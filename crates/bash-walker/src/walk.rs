@@ -42,6 +42,14 @@ pub struct Ctx {
     pub stdin: Option<Arc<File>>,
     pub stdout: Arc<File>,
     pub stderr: Arc<File>,
+    /// Streams for fds above 2 (`exec 3>&1`, `cmd 3>file`): resolved
+    /// walker-side by later dup redirects, and dup2'd into spawned children
+    /// so external programs see them too, as under bash.
+    pub fds: std::collections::HashMap<u32, Arc<File>>,
+    /// True on a ctx layered by redirects or pipeline plumbing. The shell's
+    /// enduring context (what a redirect-only `exec` replaces) substitutes
+    /// only at non-derived entry points, so per-command redirects still win.
+    pub derived: bool,
 }
 
 impl Ctx {
@@ -54,7 +62,6 @@ impl Ctx {
 }
 
 /// State the whole invocation shares regardless of subshell nesting.
-#[derive(Default)]
 pub struct Shared {
     pub bg: Vec<Child>,
     pub procsub_temps: Vec<PathBuf>,
@@ -64,6 +71,26 @@ pub struct Shared {
     /// Status of the most recent command substitution — an assignment-only
     /// command's status in bash (`x=$(false); echo $?` is 1).
     pub last_capture_status: Option<i32>,
+    /// The shell's own context after a redirect-only `exec` — replaces the
+    /// base ctx for the rest of the invocation. Subshells and pipeline
+    /// stages save/restore it, so their `exec` does not leak out.
+    pub persistent_ctx: Option<Ctx>,
+    pub clock: Arc<dyn crate::clock::Clock>,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            bg: Vec::new(),
+            procsub_temps: Vec::new(),
+            temp_counter: 0,
+            func_depth: 0,
+            loop_depth: 0,
+            last_capture_status: None,
+            persistent_ctx: None,
+            clock: Arc::new(crate::clock::RealClock::default()),
+        }
+    }
 }
 
 pub struct Exec<'a> {
@@ -95,6 +122,13 @@ impl<'a> Exec<'a> {
     }
 
     pub fn exec(&mut self, cmd: &Command, ctx: &Ctx, tested: bool) -> Result<i32, Flow> {
+        let substituted;
+        let ctx = if !ctx.derived && self.shared.persistent_ctx.is_some() {
+            substituted = self.shared.persistent_ctx.clone().expect("checked is_some");
+            &substituted
+        } else {
+            ctx
+        };
         let status = self.exec_inner(cmd, ctx, tested)?;
         self.state.last_status = status;
         if status != 0
@@ -116,14 +150,19 @@ impl<'a> Exec<'a> {
                 Ok(i32::from(st == 0))
             }
             Command::Time(inner) => {
-                let start = std::time::Instant::now();
+                let clock = Arc::clone(&self.shared.clock);
+                let wall_before = clock.now_monotonic();
+                let cpu_before = clock.cpu_times();
                 let st = self.exec(inner, ctx, tested)?;
-                let secs = start.elapsed().as_secs_f64();
-                // user/sys would need wait4 rusage plumbing; real is measured.
+                let wall = clock.now_monotonic().saturating_sub(wall_before);
+                let cpu_after = clock.cpu_times();
+                let user = cpu_after.user.saturating_sub(cpu_before.user);
+                let sys = cpu_after.sys.saturating_sub(cpu_before.sys);
                 ctx.write_err(&format!(
-                    "\nreal\t{}m{:.3}s\nuser\t0m0.000s\nsys\t0m0.000s\n",
-                    (secs / 60.0) as u64,
-                    secs % 60.0
+                    "\nreal\t{}\nuser\t{}\nsys\t{}\n",
+                    fmt_interval(wall),
+                    fmt_interval(user),
+                    fmt_interval(sys)
                 ));
                 Ok(st)
             }
@@ -221,6 +260,13 @@ impl<'a> Exec<'a> {
     /// by real OS pipes; walker-internal stages run inline, buffering into
     /// an anonymous temp file when something downstream needs their output.
     fn exec_pipeline(&mut self, stages: &[Command], ctx: &Ctx, _tested: bool) -> Result<i32, Flow> {
+        let saved_pctx = self.shared.persistent_ctx.clone();
+        let r = self.exec_pipeline_inner(stages, ctx);
+        self.shared.persistent_ctx = saved_pctx;
+        r
+    }
+
+    fn exec_pipeline_inner(&mut self, stages: &[Command], ctx: &Ctx) -> Result<i32, Flow> {
         let n = stages.len();
         let mut statuses: Vec<Option<i32>> = vec![None; n];
         let mut waiting: Vec<Option<Child>> = Vec::with_capacity(n);
@@ -238,7 +284,8 @@ impl<'a> Exec<'a> {
             if let Command::Simple(s) = stage {
                 match sub.prepare_simple(s, ctx)? {
                     Prepared::External { fields, assigns, redirects } => {
-                        let stage_ctx = Ctx { stdin: stage_stdin, ..ctx.clone() };
+                        let stage_ctx =
+                            Ctx { stdin: stage_stdin, derived: true, ..ctx.clone() };
                         let stage_ctx = match sub.apply_redirects(&redirects, &stage_ctx) {
                             Err(Flow::RedirectFailed(msg)) => {
                                 ctx.write_err(&format!("bash-walker: {msg}\n"));
@@ -302,6 +349,8 @@ impl<'a> Exec<'a> {
                 stdin: stage_stdin,
                 stdout: out_arc,
                 stderr: Arc::clone(&ctx.stderr),
+                fds: ctx.fds.clone(),
+                derived: true,
             };
             let st = match sub.exec(stage, &stage_ctx, true) {
                 Ok(st) => st,
@@ -343,10 +392,12 @@ impl<'a> Exec<'a> {
 
     fn run_subshell(&mut self, inner: &Command, ctx: &Ctx, tested: bool) -> Result<i32, Flow> {
         let saved_cwd = std::env::current_dir().ok();
+        let saved_pctx = self.shared.persistent_ctx.clone();
         let mut sub_state = self.state.clone();
         let mut sub = Exec { state: &mut sub_state, shared: &mut *self.shared };
         let r = sub.exec(inner, ctx, tested);
         let capture_status = sub_state.last_status;
+        self.shared.persistent_ctx = saved_pctx;
         if let Some(c) = saved_cwd {
             let _ = std::env::set_current_dir(c);
         }
@@ -523,7 +574,7 @@ impl<'a> Exec<'a> {
             let stage_stdin = if i == 0 { None } else { next_stdin.take() };
             match sub.prepare_simple(s, ctx)? {
                 Prepared::External { fields, assigns, redirects } => {
-                    let stage_ctx = Ctx { stdin: stage_stdin, ..ctx.clone() };
+                    let stage_ctx = Ctx { stdin: stage_stdin, derived: true, ..ctx.clone() };
                     let stage_ctx = match sub.apply_redirects(&redirects, &stage_ctx) {
                         Err(Flow::RedirectFailed(msg)) => {
                             ctx.write_err(&format!("bash-walker: {msg}\n"));
@@ -668,6 +719,18 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// Spawn one external command and wait — the `exec cmd` path, where the
+    /// command's status becomes the shell's exit status.
+    pub(crate) fn run_external_wait(&mut self, fields: &[String], ctx: &Ctx) -> Result<i32, Flow> {
+        match self.spawn(fields, &[], ctx, SpawnOut::Ctx, ctx)?.take() {
+            SpawnResult::Child(mut ch) => Ok(ch
+                .wait()
+                .map(|st| st.code().unwrap_or(128 + s_signal(&st)))
+                .unwrap_or(1)),
+            SpawnResult::Failed(st) => Ok(st),
+        }
+    }
+
     /// `FOO=1 builtin/function`: the assignments live for the call only.
     fn with_temp_assigns<T>(
         &mut self,
@@ -740,6 +803,27 @@ impl<'a> Exec<'a> {
                 .try_clone()
                 .map_err(|e| Flow::Fatal(e.to_string()))?,
         ));
+        if !ctx.fds.is_empty() {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let mut dups: Vec<(File, i32)> = Vec::with_capacity(ctx.fds.len());
+            for (n, f) in &ctx.fds {
+                let h = f.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?;
+                dups.push((h, *n as i32));
+            }
+            // SAFETY: dup2 is async-signal-safe; the handles live in the
+            // closure, which the Command owns until spawn completes.
+            unsafe {
+                cmd.pre_exec(move || {
+                    for (h, dst) in &dups {
+                        if libc::dup2(h.as_raw_fd(), *dst) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
         match cmd.spawn() {
             Ok(ch) => Ok(SpawnSlot(Some(SpawnResult::Child(ch)))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -759,6 +843,7 @@ impl<'a> Exec<'a> {
 
     fn apply_redirects(&mut self, redirects: &[Redirect], ctx: &Ctx) -> Result<Ctx, Flow> {
         let mut c = ctx.clone();
+        c.derived = true;
         for r in redirects {
             match r.op {
                 RedirectOp::Out | RedirectOp::Append => {
@@ -774,9 +859,7 @@ impl<'a> Exec<'a> {
                         None | Some(1) => c.stdout = Arc::new(f),
                         Some(2) => c.stderr = Arc::new(f),
                         Some(n) => {
-                            return Err(Flow::Fatal(format!(
-                                "{n}>: only fds 1 and 2 are supported by bash-walker"
-                            )))
+                            c.fds.insert(n, Arc::new(f));
                         }
                     }
                 }
@@ -803,28 +886,32 @@ impl<'a> Exec<'a> {
                     let target = expand::expand_redirect_target(self, &c, &r.target)?;
                     let src = r.fd.unwrap_or(1);
                     match target.as_str() {
-                        "1" => match src {
-                            1 => {}
-                            2 => c.stderr = Arc::clone(&c.stdout),
-                            n => {
-                                return Err(Flow::Fatal(format!(
-                                    "{n}>&1: only fds 1 and 2 are supported by bash-walker"
-                                )))
-                            }
-                        },
-                        "2" => match src {
-                            2 => {}
-                            1 => c.stdout = Arc::clone(&c.stderr),
-                            n => {
-                                return Err(Flow::Fatal(format!(
-                                    "{n}>&2: only fds 1 and 2 are supported by bash-walker"
-                                )))
-                            }
-                        },
                         "-" => {
                             return Err(Flow::Fatal(
                                 ">&-: closing fds is not supported by bash-walker".into(),
                             ))
+                        }
+                        t if t.parse::<u32>().is_ok() => {
+                            let m: u32 = t.parse().expect("checked numeric");
+                            let stream = match m {
+                                1 => Arc::clone(&c.stdout),
+                                2 => Arc::clone(&c.stderr),
+                                n => match c.fds.get(&n) {
+                                    Some(f) => Arc::clone(f),
+                                    None => {
+                                        return Err(Flow::RedirectFailed(format!(
+                                            "{n}: Bad file descriptor"
+                                        )))
+                                    }
+                                },
+                            };
+                            match src {
+                                1 => c.stdout = stream,
+                                2 => c.stderr = stream,
+                                n => {
+                                    c.fds.insert(n, stream);
+                                }
+                            }
                         }
                         // `>& file` (no fd, non-numeric): both streams to it.
                         path if r.fd.is_none() => {
@@ -917,6 +1004,12 @@ fn errexit_eligible(cmd: &Command) -> bool {
     )
 }
 
+/// bash's `time` interval shape: `1m2.345s`.
+fn fmt_interval(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    format!("{}m{:.3}s", (secs / 60.0) as u64, secs % 60.0)
+}
+
 /// io::Error's Display appends " (os error N)"; bash's messages don't.
 /// Agents read these strings, so speak bash's dialect.
 pub fn errmsg(e: &std::io::Error) -> String {
@@ -956,6 +1049,7 @@ pub fn run_capture(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> 
     let capture = ex.anon_temp()?;
     let handle = capture.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?;
     let saved_cwd = std::env::current_dir().ok();
+    let saved_pctx = ex.shared.persistent_ctx.clone();
     let mut sub_state = ex.state.clone();
     let status = {
         let mut sub = Exec { state: &mut sub_state, shared: &mut *ex.shared };
@@ -963,6 +1057,8 @@ pub fn run_capture(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> 
             stdin: ctx.stdin.clone(),
             stdout: Arc::new(capture),
             stderr: Arc::clone(&ctx.stderr),
+            fds: ctx.fds.clone(),
+            derived: true,
         };
         match run_source(&mut sub, &sub_ctx, src, true) {
             Ok(st) => st,
@@ -970,6 +1066,7 @@ pub fn run_capture(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> 
             Err(f) => return Err(f),
         }
     };
+    ex.shared.persistent_ctx = saved_pctx;
     if let Some(c) = saved_cwd {
         let _ = std::env::set_current_dir(c);
     }
@@ -985,34 +1082,62 @@ pub fn run_capture(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> 
     Ok(out)
 }
 
-/// `<(...)`: run to completion into a NAMED temp file and substitute its
-/// path. Output-equivalent to bash's FIFO for finite streams; the file is
-/// cleaned up when the invocation ends.
+/// `<(...)`: a real FIFO fed by a second walker process running the inner
+/// script — bash's own mechanism (fork + FIFO), done by re-exec because the
+/// walker cannot safely fork itself. Concurrent like bash: the consumer
+/// reads while the child writes, so early-exit consumers (`head`) and
+/// infinite producers behave correctly. The child inherits the full shell
+/// state (cwd + variables) via a throwaway state file.
 pub fn run_procsub(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> {
     ex.shared.temp_counter += 1;
-    let path = std::env::temp_dir().join(format!(
-        "bash-walker-procsub-{}-{}",
-        std::process::id(),
-        ex.shared.temp_counter
-    ));
-    let f = File::create(&path).map_err(|e| Flow::Fatal(e.to_string()))?;
-    ex.shared.procsub_temps.push(path.clone());
-    let saved_cwd = std::env::current_dir().ok();
-    let mut sub_state = ex.state.clone();
-    {
-        let mut sub = Exec { state: &mut sub_state, shared: &mut *ex.shared };
-        let sub_ctx = Ctx {
-            stdin: None,
-            stdout: Arc::new(f),
-            stderr: Arc::clone(&ctx.stderr),
-        };
-        match run_source(&mut sub, &sub_ctx, src, true) {
-            Ok(_) | Err(Flow::Exit(_)) => {}
-            Err(f) => return Err(f),
-        }
+    let tag = format!("{}-{}", std::process::id(), ex.shared.temp_counter);
+    let fifo = std::env::temp_dir().join(format!("bash-walker-procsub-{tag}"));
+    let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes().to_vec())
+        .map_err(|e| Flow::Fatal(format!("procsub path: {e}")))?;
+    if unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) } != 0 {
+        return Err(Flow::Fatal(format!(
+            "procsub fifo: {}",
+            errmsg(&std::io::Error::last_os_error())
+        )));
     }
-    if let Some(c) = saved_cwd {
-        let _ = std::env::set_current_dir(c);
+    ex.shared.procsub_temps.push(fifo.clone());
+
+    let state_path = std::env::temp_dir().join(format!("bash-walker-procsub-state-{tag}"));
+    crate::state::save(&state_path, ex.state)
+        .map_err(|e| Flow::Fatal(format!("procsub state: {e}")))?;
+    ex.shared.procsub_temps.push(state_path.clone());
+
+    // The child opens the FIFO itself, write-only — blocking until the
+    // consumer opens the read side, and dying on SIGPIPE when the consumer
+    // leaves early. Opening it here (the only non-blocking option is
+    // O_RDWR) would make this process a phantom reader and break both.
+    let mut cmd = Proc::new(walker_exe());
+    cmd.arg("--state")
+        .arg(&state_path)
+        .arg("--stdout-path")
+        .arg(&fifo)
+        .arg("-c")
+        .arg(src)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            ctx.stderr
+                .try_clone()
+                .map_err(|e| Flow::Fatal(e.to_string()))?,
+        ));
+    match cmd.spawn() {
+        Ok(ch) => ex.shared.bg.push(ch),
+        Err(e) => return Err(Flow::Fatal(format!("procsub: {}", errmsg(&e)))),
     }
-    Ok(path.to_string_lossy().into_owned())
+    Ok(fifo.to_string_lossy().into_owned())
+}
+
+/// The walker's own binary, for re-exec (process substitution, and later
+/// compound backgrounding). Under `cargo test` the current exe is the test
+/// harness, so $BASH_WALKER_SELF names the real binary explicitly.
+fn walker_exe() -> PathBuf {
+    std::env::var_os("BASH_WALKER_SELF")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+        .unwrap_or_else(|| PathBuf::from("bash-walker"))
 }
