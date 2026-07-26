@@ -24,16 +24,22 @@ use std::path::PathBuf;
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut path: Option<PathBuf> = std::env::var("BASH_WALKER_STATE").ok().map(PathBuf::from);
-    if args.first().is_some_and(|a| a == "--state") {
-        let Some(p) = args.get(1) else {
-            eprintln!("bash-walker: --state requires a file path argument");
-            std::process::exit(2);
-        };
-        path = Some(PathBuf::from(p));
-        args.drain(..2);
+    let mut mode = bash_walker::state::Persist::All;
+    if let Some(first) = args.first() {
+        if first == "--state" || first == "--state-cwd" {
+            if first == "--state-cwd" {
+                mode = bash_walker::state::Persist::CwdOnly;
+            }
+            let Some(p) = args.get(1) else {
+                eprintln!("bash-walker: {first} requires a file path argument");
+                std::process::exit(2);
+            };
+            path = Some(PathBuf::from(p));
+            args.drain(..2);
+        }
     }
     let mut state = match &path {
-        Some(p) => bash_walker::load(p),
+        Some(p) => bash_walker::state::load_mode(p, mode),
         None => bash_walker::ShellState::default(),
     };
 
@@ -70,7 +76,7 @@ fn main() {
 
     let (output, returncode) = bash_walker::run(&command, &mut state);
     if let Some(p) = &path {
-        if let Err(e) = bash_walker::save(p, &state) {
+        if let Err(e) = bash_walker::state::save_mode(p, &state, mode) {
             eprintln!("bash-walker: failed to save state: {e}");
         }
     }

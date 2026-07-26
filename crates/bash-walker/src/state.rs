@@ -122,11 +122,27 @@ impl ShellState {
     }
 }
 
+/// What crosses invocations. `CwdOnly` matches Claude Code's semantics
+/// ("The working directory persists between commands, but shell state does
+/// not") — the experiment's persistence mode; `All` also carries variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Persist {
+    All,
+    CwdOnly,
+}
+
 pub fn load(path: &Path) -> ShellState {
-    let persisted: PersistedState = std::fs::read_to_string(path)
+    load_mode(path, Persist::All)
+}
+
+pub fn load_mode(path: &Path, mode: Persist) -> ShellState {
+    let mut persisted: PersistedState = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    if mode == Persist::CwdOnly {
+        persisted.vars.clear();
+    }
     if let Some(cwd) = &persisted.cwd {
         // Restore the working directory for real: the process cwd is the
         // single source of truth during a run (globs, relative redirects,
@@ -146,9 +162,17 @@ pub fn load(path: &Path) -> ShellState {
 }
 
 pub fn save(path: &Path, state: &ShellState) -> std::io::Result<()> {
+    save_mode(path, state, Persist::All)
+}
+
+pub fn save_mode(path: &Path, state: &ShellState, mode: Persist) -> std::io::Result<()> {
     let persisted = PersistedState {
         cwd: std::env::current_dir().ok(),
-        vars: state.vars.clone(),
+        vars: if mode == Persist::CwdOnly {
+            Default::default()
+        } else {
+            state.vars.clone()
+        },
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
