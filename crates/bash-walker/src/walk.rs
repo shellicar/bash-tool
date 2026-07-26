@@ -1106,9 +1106,15 @@ fn flatten_pipeline(cmd: &Command, out: &mut Vec<Command>) {
     }
 }
 
-/// Parse and execute a source string in the current shell (top level, and
-/// the `eval`/`source` builtins).
+/// Parse and execute a source string in the current shell (top level, the
+/// `eval`/`source` builtins, and substitution interiors).
 pub fn run_source(ex: &mut Exec, ctx: &Ctx, src: &str, tested: bool) -> Result<i32, Flow> {
+    // Empty input is a valid empty program — `bash -c ''`, `$()`, and
+    // `` `` `` all succeed doing nothing. Found live: `` (`attrs`) `` docs
+    // text made Claude write empty backtick pairs bash happily ran.
+    if src.trim().is_empty() {
+        return Ok(0);
+    }
     let cmd = bash_parser::parse(src)
         .map_err(|e| Flow::Fatal(format!("syntax error: {e}")))?;
     ex.exec(&cmd, ctx, tested)

@@ -782,6 +782,27 @@ fn pipeline_waits_for_every_stage_like_bash() {
 }
 
 #[test]
+fn empty_backtick_substitution_expands_to_nothing() {
+    // Found by sequence replay: docs text like (`attrs`) produced empty
+    // backtick pairs that bash runs as an empty program; the walker fed ""
+    // to the parser and died with unexpected-end-of-input.
+    let expected = ("xy\n".to_string(), 0);
+
+    let actual = run("echo x``y");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn empty_dollar_substitution_expands_to_nothing() {
+    let expected = ("ab\n".to_string(), 0);
+
+    let actual = run("echo a$()b");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn syntax_error_reports_status_2() {
     let (output, status) = run("if true; then");
 
