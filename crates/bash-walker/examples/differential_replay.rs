@@ -130,9 +130,13 @@ fn run_against_bash(bash: &Path, commands_path: &str, cap: usize) {
         .collect();
     eprintln!("selected {} of {} unique commands", selected.len(), commands.len());
 
-    const WORKERS: usize = 8;
+    // Tunable for slow environments (qemu-emulated containers).
+    let workers: usize = std::env::var("BW_REPLAY_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     let done = std::sync::atomic::AtomicUsize::new(0);
-    let chunk = selected.len().div_ceil(WORKERS);
+    let chunk = selected.len().div_ceil(workers);
     let tally: Tally = std::thread::scope(|s| {
         let mut handles = Vec::new();
         for (w, work) in selected.chunks(chunk.max(1)).enumerate() {
@@ -234,7 +238,11 @@ fn run_one(bin: &Path, args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Optio
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let timeout_secs: u64 = std::env::var("BW_REPLAY_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let status = loop {
         match child.try_wait().ok()? {
             Some(st) => break st,

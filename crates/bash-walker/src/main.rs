@@ -8,25 +8,34 @@
 //!   - `-c '<script>'`: direct mode for humans and tests; raw output on
 //!     stdout, status as the exit code.
 //!
-//! State file: $BASH_WALKER_STATE, defaulting to $HOME/.bash-walker-state.json.
-//! Read before the script runs, written back after — cwd and variables
-//! survive between invocations.
+//! State persistence is a per-arm A/B switch: `--state <path>` (or
+//! $BASH_WALKER_STATE) persists cwd+variables across invocations; absent,
+//! every invocation is fresh, byte-identical to the baseline's
+//! bash-per-call. Default off because persisted cwd under PARALLEL tool
+//! calls is a write race (Claude Code exhibits last-finisher-wins) and a
+//! permission-gating engine needs a command's paths interpretable without
+//! invisible prior state — but whether persistence measurably helps is an
+//! open experiment (prompt-told × persistence, 2×2), so both modes are
+//! first-class.
 
 use std::io::Read;
 use std::path::PathBuf;
 
-fn state_path() -> PathBuf {
-    if let Ok(p) = std::env::var("BASH_WALKER_STATE") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".bash-walker-state.json")
-}
-
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let path = state_path();
-    let mut state = bash_walker::load(&path);
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut path: Option<PathBuf> = std::env::var("BASH_WALKER_STATE").ok().map(PathBuf::from);
+    if args.first().is_some_and(|a| a == "--state") {
+        let Some(p) = args.get(1) else {
+            eprintln!("bash-walker: --state requires a file path argument");
+            std::process::exit(2);
+        };
+        path = Some(PathBuf::from(p));
+        args.drain(..2);
+    }
+    let mut state = match &path {
+        Some(p) => bash_walker::load(p),
+        None => bash_walker::ShellState::default(),
+    };
 
     let (command, direct) = match args.first().map(String::as_str) {
         Some("-c") => match args.get(1) {
@@ -60,8 +69,10 @@ fn main() {
     };
 
     let (output, returncode) = bash_walker::run(&command, &mut state);
-    if let Err(e) = bash_walker::save(&path, &state) {
-        eprintln!("bash-walker: failed to save state: {e}");
+    if let Some(p) = &path {
+        if let Err(e) = bash_walker::save(p, &state) {
+            eprintln!("bash-walker: failed to save state: {e}");
+        }
     }
 
     if direct {
