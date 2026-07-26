@@ -254,10 +254,13 @@ fn run_one(bin: &Path, args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Optio
             None => std::thread::sleep(std::time::Duration::from_millis(5)),
         }
     };
-    let mut out = String::new();
+    // Cap the read: a whitelisted generator (`seq 1 1000000000`) can emit
+    // gigabytes; both sides get the same cap so the diff stays fair.
+    let mut buf = Vec::new();
     let mut fh = std::fs::File::open(&out_path).ok()?;
     let _ = fh.seek(SeekFrom::Start(0));
-    let _ = fh.read_to_string(&mut out);
+    let _ = std::io::Read::take(&mut fh, 2 * 1024 * 1024).read_to_end(&mut buf);
+    let out = String::from_utf8_lossy(&buf).into_owned();
     let _ = std::fs::remove_file(&out_path);
     Some((out, status.code().unwrap_or(128)))
 }
