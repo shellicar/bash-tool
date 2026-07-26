@@ -30,7 +30,7 @@ pub fn run(src: &str, state: &mut ShellState) -> (String, i32) {
 pub fn run_with_clock(
     src: &str,
     state: &mut ShellState,
-    clk: Arc<dyn clock::Clock>,
+    clk: Arc<dyn clock::Clock + Send + Sync>,
 ) -> (String, i32) {
     run_with(src, state, clk, Arc::new(clock::RealEntropy))
 }
@@ -39,8 +39,8 @@ pub fn run_with_clock(
 pub fn run_with(
     src: &str,
     state: &mut ShellState,
-    clk: Arc<dyn clock::Clock>,
-    entropy: Arc<dyn clock::Entropy>,
+    clk: Arc<dyn clock::Clock + Send + Sync>,
+    entropy: Arc<dyn clock::Entropy + Send + Sync>,
 ) -> (String, i32) {
     let mut shared = Shared { clock: clk, entropy, ..Shared::default() };
     let mut ex = Exec { state, shared: &mut shared };

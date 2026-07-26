@@ -272,7 +272,7 @@ fn echo(ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
     if !suppress_newline {
         out.push('\n');
     }
-    ctx.write_out(&out);
+    ctx.write_out_pipeaware(&out)?;
     Ok(0)
 }
 
@@ -316,7 +316,7 @@ fn printf(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
     }
     match var_target {
         Some(v) => ex.state.set_var(&v, out),
-        None => ctx.write_out(&out),
+        None => ctx.write_out_pipeaware(&out)?,
     }
     Ok(status)
 }

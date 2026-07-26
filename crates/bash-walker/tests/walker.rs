@@ -744,6 +744,44 @@ fn background_function_call_runs_in_the_job() {
 }
 
 #[test]
+fn infinite_internal_producer_dies_when_the_consumer_leaves() {
+    // The temp-file pipeline would materialise this forever; real pipes
+    // mean head takes two lines and the loop dies of a broken pipe.
+    let start = std::time::Instant::now();
+    let (output, status) = run("while true; do echo y; done | head -2");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "y\ny\n");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "producer did not stop after the consumer left"
+    );
+}
+
+#[test]
+fn compound_stage_pipes_into_an_external_consumer() {
+    let (output, status) = run("(echo one; echo two) | wc -l");
+
+    assert_eq!(status, 0);
+    assert_eq!(output.trim(), "2");
+}
+
+#[test]
+fn pipeline_waits_for_every_stage_like_bash() {
+    // The consumer leaves after one line, but bash still waits for the
+    // whole pipeline — sleep is not killed; only the NEXT write dies.
+    let start = std::time::Instant::now();
+    let (output, status) = run("(echo first; sleep 1; echo second) | head -1");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "first\n");
+    assert!(
+        start.elapsed() >= Duration::from_secs(1),
+        "pipeline returned before its slowest stage"
+    );
+}
+
+#[test]
 fn syntax_error_reports_status_2() {
     let (output, status) = run("if true; then");
 

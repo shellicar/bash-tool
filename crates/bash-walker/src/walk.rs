@@ -59,6 +59,15 @@ impl Ctx {
     pub fn write_out(&self, msg: &str) {
         let _ = (&*self.stdout).write_all(msg.as_bytes());
     }
+    /// For builtins that can sit in a pipeline producing output (echo,
+    /// printf): a broken pipe must kill the stage like SIGPIPE kills bash's
+    /// subshell, or an upstream loop outlives its departed consumer.
+    pub fn write_out_pipeaware(&self, msg: &str) -> Result<(), Flow> {
+        match (&*self.stdout).write_all(msg.as_bytes()) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Err(Flow::Exit(141)),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// State the whole invocation shares regardless of subshell nesting.
@@ -74,8 +83,8 @@ pub struct Shared {
     /// base ctx for the rest of the invocation. Subshells and pipeline
     /// stages save/restore it, so their `exec` does not leak out.
     pub persistent_ctx: Option<Ctx>,
-    pub clock: Arc<dyn crate::clock::Clock>,
-    pub entropy: Arc<dyn crate::clock::Entropy>,
+    pub clock: Arc<dyn crate::clock::Clock + Send + Sync>,
+    pub entropy: Arc<dyn crate::clock::Entropy + Send + Sync>,
 }
 
 impl Default for Shared {
@@ -271,6 +280,7 @@ impl<'a> Exec<'a> {
         let n = stages.len();
         let mut statuses: Vec<Option<i32>> = vec![None; n];
         let mut waiting: Vec<Option<Child>> = Vec::with_capacity(n);
+        let mut threads: Vec<Option<std::thread::JoinHandle<i32>>> = Vec::with_capacity(n);
         let mut next_stdin: Option<Arc<File>> = None;
 
         for (i, stage) in stages.iter().enumerate() {
@@ -279,10 +289,10 @@ impl<'a> Exec<'a> {
 
             // A stage is a subshell: cloned state, so its cd/vars stay its own.
             let mut stage_state = self.state.clone();
-            let mut sub = Exec { state: &mut stage_state, shared: &mut *self.shared };
 
             // An external simple command spawns and stays concurrent.
             if let Command::Simple(s) = stage {
+                let mut sub = Exec { state: &mut stage_state, shared: &mut *self.shared };
                 match sub.prepare_simple(s, ctx)? {
                     Prepared::External { fields, assigns, redirects } => {
                         let stage_ctx =
@@ -296,6 +306,7 @@ impl<'a> Exec<'a> {
                                     let empty = sub.anon_temp()?;
                                     next_stdin = Some(Arc::new(empty));
                                 }
+                                threads.push(None);
                                 continue;
                             }
                             other => other?,
@@ -326,37 +337,56 @@ impl<'a> Exec<'a> {
                                 }
                             }
                         }
+                        threads.push(None);
                         continue;
                     }
-                    Prepared::Internal => {} // falls through to the inline path
+                    Prepared::Internal => {} // falls through to the threaded path
                 }
             }
 
-            // Internal stage: run inline against the cloned state.
-            let (out_arc, capture): (Arc<File>, Option<File>) = if last {
-                (Arc::clone(&ctx.stdout), None)
+            // Internal stage: its own interpreter on its own thread, wired
+            // by a real pipe — concurrent with every other stage, exactly
+            // like bash's forked subshell. Foreground pipelines join before
+            // returning, so no stage outlives the process.
+            let (out_file, reader): (File, Option<File>) = if last {
+                (
+                    ctx.stdout.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?,
+                    None,
+                )
             } else {
-                let f = sub.anon_temp()?;
-                let h = f.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?;
-                (Arc::new(f), Some(h))
+                let (r, w) = std::io::pipe().map_err(|e| Flow::Fatal(e.to_string()))?;
+                (
+                    File::from(std::os::fd::OwnedFd::from(w)),
+                    Some(File::from(std::os::fd::OwnedFd::from(r))),
+                )
             };
             let stage_ctx = Ctx {
                 stdin: stage_stdin,
-                stdout: out_arc,
+                stdout: Arc::new(out_file),
                 stderr: Arc::clone(&ctx.stderr),
                 fds: ctx.fds.clone(),
                 derived: true,
             };
-            let st = match sub.exec(stage, &stage_ctx, true) {
-                Ok(st) => st,
-                Err(Flow::Exit(st)) => st,
-                Err(other) => return Err(other),
-            };
-            statuses[i] = Some(st);
+            let stage_cmd = stage.clone();
+            let clock = Arc::clone(&self.shared.clock);
+            let entropy = Arc::clone(&self.shared.entropy);
+            let handle = std::thread::spawn(move || -> i32 {
+                let mut shared = Shared { clock, entropy, ..Shared::default() };
+                let mut sub = Exec { state: &mut stage_state, shared: &mut shared };
+                match sub.exec(&stage_cmd, &stage_ctx, true) {
+                    Ok(st) => st,
+                    Err(Flow::Exit(st)) | Err(Flow::Return(st)) => st,
+                    Err(Flow::Break(_)) | Err(Flow::Continue(_)) => 0,
+                    Err(Flow::Fatal(msg)) | Err(Flow::RedirectFailed(msg)) => {
+                        stage_ctx.write_err(&format!("bash-walker: {msg}\n"));
+                        1
+                    }
+                }
+            });
+            threads.push(Some(handle));
             waiting.push(None);
-            if let Some(mut h) = capture {
-                let _ = h.seek(SeekFrom::Start(0));
-                next_stdin = Some(Arc::new(h));
+            if let Some(r) = reader {
+                next_stdin = Some(Arc::new(r));
             }
         }
 
@@ -367,6 +397,11 @@ impl<'a> Exec<'a> {
                     .map(|s| s.code().unwrap_or(128 + s_signal(&s)))
                     .unwrap_or(1);
                 statuses[i] = Some(st);
+            }
+        }
+        for (i, slot) in threads.iter_mut().enumerate() {
+            if let Some(handle) = slot.take() {
+                statuses[i] = Some(handle.join().unwrap_or(1));
             }
         }
 
