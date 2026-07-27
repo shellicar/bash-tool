@@ -842,6 +842,19 @@ fn signal_death_prints_bash_epitaph_and_status() {
 }
 
 #[test]
+fn double_star_without_globstar_behaves_like_a_single_star() {
+    // Found by sequence replay: `*.py **/*.py` matched a top-level file
+    // TWICE (walker treated ** as recursive; bash without `shopt -s
+    // globstar` treats ** as an ordinary single-segment *).
+    let d = temp_dir("doublestar");
+    std::fs::write(d.join("a.py"), "").unwrap();
+    let (output, _) = run(&format!("echo {}/*.py {}/**/*.py", d.display(), d.display()));
+
+    let expected = format!("{}/a.py {}/**/*.py\n", d.display(), d.display());
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn syntax_error_reports_status_2() {
     let (output, status) = run("if true; then");
 

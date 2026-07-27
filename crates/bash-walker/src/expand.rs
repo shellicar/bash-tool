@@ -213,11 +213,20 @@ fn glob_field(text: &str, pattern: &str, cwd: &std::path::Path) -> Vec<String> {
         require_literal_separator: true,
         require_literal_leading_dot: true,
     };
+    // The `glob` crate treats `**` as a recursive descent (its own
+    // extension). Bash's pathname expansion has no such thing unless
+    // `shopt -s globstar` is on (which we don't support) — without it,
+    // `**` is just `*` written twice, matching one path segment same as a
+    // single `*`. Collapsing the run keeps us on bash's semantics: found
+    // live via sequence replay, `*.py **/*.py` matched a top-level file
+    // TWICE (once per pattern) because our `**` was recursing into "zero
+    // directories deep" and re-matching the first pattern's hit.
+    let pattern = collapse_double_star(pattern);
     let relative = !pattern.starts_with('/');
     let full_pattern = if relative {
         format!("{}/{}", glob::Pattern::escape(&cwd.to_string_lossy()), pattern)
     } else {
-        pattern.to_string()
+        pattern.clone()
     };
     match glob::glob_with(&full_pattern, options) {
         Ok(paths) => {
@@ -240,6 +249,30 @@ fn glob_field(text: &str, pattern: &str, cwd: &std::path::Path) -> Vec<String> {
         }
         Err(_) => vec![text.to_string()],
     }
+}
+
+/// Collapses any run of two or more `*` into one. A literal `*` from quoted
+/// text is escaped by `glob::Pattern::escape` into a bracket class, never a
+/// bare `*`, so every bare `*` here is a real (unquoted) wildcard and safe
+/// to fold.
+fn collapse_double_star(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut stars = 0usize;
+    for c in pattern.chars() {
+        if c == '*' {
+            stars += 1;
+            continue;
+        }
+        if stars > 0 {
+            out.push('*');
+            stars = 0;
+        }
+        out.push(c);
+    }
+    if stars > 0 {
+        out.push('*');
+    }
+    out
 }
 
 /// Brace expansion: `{a,b}` alternatives and `{n..m}`/`{a..z}` ranges,
