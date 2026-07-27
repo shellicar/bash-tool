@@ -8,6 +8,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command as Proc, Stdio};
 use std::sync::Arc;
@@ -646,6 +647,7 @@ impl<'a> Exec<'a> {
             funcs: self.state.funcs.clone(),
             vars: self.state.vars.clone(),
             cwd: self.state.cwd.clone(),
+            umask: self.state.umask,
         };
         let payload = serde_json::to_string(&job)
             .map_err(|e| Flow::Fatal(format!("background job: {e}")))?;
@@ -844,6 +846,18 @@ impl<'a> Exec<'a> {
         for (k, v) in assigns {
             cmd.env(k, v);
         }
+        // umask is process state in bash's own model, but ours never touches
+        // the WALKER's process umask (racy under threaded pipeline stages,
+        // same reasoning as cwd/env) — it's set post-fork, pre-exec, in the
+        // single-threaded child, exactly like the fd-dup2 wiring above.
+        let child_umask = self.state.umask;
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(move || {
+                libc::umask(child_umask as libc::mode_t);
+                Ok(())
+            });
+        }
         cmd.stdin(match &ctx.stdin {
             Some(f) => Stdio::from(f.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?),
             None => Stdio::null(),
@@ -917,6 +931,7 @@ impl<'a> Exec<'a> {
                         .write(true)
                         .append(r.op == RedirectOp::Append)
                         .truncate(r.op == RedirectOp::Out)
+                        .mode(self.state.create_mode())
                         .open(self.state.resolve(&path))
                         .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
                     match r.fd {
@@ -934,6 +949,7 @@ impl<'a> Exec<'a> {
                         .write(true)
                         .append(r.op == RedirectOp::AppendOutErr)
                         .truncate(r.op == RedirectOp::OutErr)
+                        .mode(self.state.create_mode())
                         .open(self.state.resolve(&path))
                         .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
                     let f = Arc::new(f);
@@ -983,6 +999,7 @@ impl<'a> Exec<'a> {
                                 .create(true)
                                 .write(true)
                                 .truncate(true)
+                                .mode(self.state.create_mode())
                                 .open(self.state.resolve(path))
                                 .map_err(|e| Flow::Fatal(format!("{path}: {e}")))?;
                             let f = Arc::new(f);

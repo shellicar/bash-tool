@@ -29,6 +29,7 @@ pub struct Var {
 pub struct PersistedState {
     pub cwd: Option<PathBuf>,
     pub vars: HashMap<String, Var>,
+    pub umask: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -59,17 +60,31 @@ pub struct ShellState {
     /// (spawns, redirects, globs, file tests), never the process cwd.
     /// `cd` is a mutation of this field; nothing ever calls chdir.
     pub cwd: PathBuf,
+    /// File-creation mask — same "state, not process" rule as cwd: nothing
+    /// ever calls the real `umask(2)` on this process (racy under threaded
+    /// pipeline stages). Files the walker creates itself get their mode
+    /// computed against this; spawned children get it set via `pre_exec`
+    /// in their own, single-threaded post-fork moment.
+    pub umask: u32,
 }
 
 impl Default for ShellState {
-    /// The composition root: the ambient environment and process cwd are
-    /// read exactly once, here, into plain data. Every later read goes
-    /// through the state.
+    /// The composition root: the ambient environment, process cwd, and
+    /// process umask are read exactly once, here, into plain data. Every
+    /// later read goes through the state.
     fn default() -> Self {
         let mut vars: HashMap<String, Var> = std::env::vars()
             .map(|(k, v)| (k, Var { value: v, exported: true }))
             .collect();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        // umask(2) has no read-only mode: it always sets and returns the
+        // OLD mask, so reading it means set-then-immediately-restore. Only
+        // safe here, at startup, before any other thread exists.
+        let umask = unsafe {
+            let prev = libc::umask(0o022);
+            libc::umask(prev);
+            prev as u32
+        };
         vars.insert(
             "PWD".to_string(),
             Var { value: cwd.to_string_lossy().into_owned(), exported: true },
@@ -84,6 +99,7 @@ impl Default for ShellState {
             last_background_pid: None,
             rematch: Vec::new(),
             cwd,
+            umask,
         }
     }
 }
@@ -149,6 +165,13 @@ impl ShellState {
         }
     }
 
+    /// The mode a newly-created regular file gets under this umask, for
+    /// files the walker creates itself (redirects) rather than a spawned
+    /// program.
+    pub fn create_mode(&self) -> u32 {
+        0o666 & !self.umask
+    }
+
     /// The environment a child process receives: the exported vars, built
     /// fresh per spawn — nothing leaks in from the (stale) process env.
     pub fn child_env(&self) -> Vec<(String, String)> {
@@ -212,6 +235,9 @@ pub fn load_mode(path: &Path, mode: Persist) -> ShellState {
             .insert("PWD".to_string(), Var { value: cwd.to_string_lossy().into_owned(), exported: true });
         state.cwd = cwd;
     }
+    if let Some(umask) = persisted.umask {
+        state.umask = umask;
+    }
     state
 }
 
@@ -222,6 +248,7 @@ pub fn save(path: &Path, state: &ShellState) -> std::io::Result<()> {
 pub fn save_mode(path: &Path, state: &ShellState, mode: Persist) -> std::io::Result<()> {
     let persisted = PersistedState {
         cwd: Some(state.cwd.clone()),
+        umask: Some(state.umask),
         vars: if mode == Persist::CwdOnly {
             Default::default()
         } else {

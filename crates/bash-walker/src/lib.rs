@@ -98,6 +98,7 @@ pub struct BackgroundJob {
     pub funcs: std::collections::HashMap<String, bash_parser::Command>,
     pub vars: std::collections::HashMap<String, state::Var>,
     pub cwd: std::path::PathBuf,
+    pub umask: u32,
 }
 
 /// Execute a background job payload, streaming to the given handles.
@@ -107,6 +108,7 @@ pub fn run_background_job(job: BackgroundJob, stdout: std::fs::File, stderr: std
         state.vars.insert(k, v);
     }
     state.cwd = job.cwd;
+    state.umask = job.umask;
     state.funcs = job.funcs;
     let mut shared = Shared::default();
     let mut ex = Exec { state: &mut state, shared: &mut shared };

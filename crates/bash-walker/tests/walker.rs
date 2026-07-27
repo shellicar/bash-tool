@@ -7,6 +7,7 @@
 //! neither is itself evidence the process-global edges are gone.
 
 use std::collections::VecDeque;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
@@ -852,6 +853,45 @@ fn double_star_without_globstar_behaves_like_a_single_star() {
 
     let expected = format!("{}/a.py {}/**/*.py\n", d.display(), d.display());
     assert_eq!(output, expected);
+}
+
+#[test]
+fn umask_changes_the_mode_of_a_walker_created_file() {
+    let d = temp_dir("umask-native");
+    let (_, status) = run(&format!("umask 077 && echo hi > {}/f.txt", d.display()));
+
+    assert_eq!(status, 0);
+    let mode = std::fs::metadata(d.join("f.txt")).unwrap().permissions().mode() & 0o777;
+    let expected = 0o600;
+    assert_eq!(mode, expected);
+}
+
+#[test]
+fn umask_reaches_a_spawned_child() {
+    let d = temp_dir("umask-spawn");
+    let (_, status) = run(&format!("umask 077 && touch {}/f.txt", d.display()));
+
+    assert_eq!(status, 0);
+    let mode = std::fs::metadata(d.join("f.txt")).unwrap().permissions().mode() & 0o777;
+    let expected = 0o600;
+    assert_eq!(mode, expected);
+}
+
+#[test]
+fn umask_with_no_argument_prints_the_current_mask() {
+    let expected = ("0027\n".to_string(), 0);
+
+    let actual = run("umask 027 && umask");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn umask_persists_across_invocations() {
+    let results = run_session(&["umask 027", "umask"]);
+
+    let expected = "0027\n";
+    assert_eq!(results[1].0, expected);
 }
 
 #[test]

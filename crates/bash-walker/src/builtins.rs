@@ -12,13 +12,13 @@ use crate::walk::{Ctx, Exec, Flow};
 const NATIVE: &[&str] = &[
     "cd", "pwd", "export", "unset", "local", "exit", "return", "break", "continue", "shift",
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
-    "echo", "printf", "exec",
+    "echo", "printf", "exec", "umask",
 ];
 
 const UNSUPPORTED: &[&str] = &[
     "declare", "typeset", "readonly", "alias", "unalias", "trap", "getopts", "ulimit",
     "jobs", "fg", "bg", "hash", "type", "help", "history", "disown", "suspend", "times",
-    "builtin", "caller", "enable", "pushd", "popd", "dirs", "umask", "mapfile", "readarray",
+    "builtin", "caller", "enable", "pushd", "popd", "dirs", "mapfile", "readarray",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -148,6 +148,7 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
         "echo" => echo(ctx, args),
         "printf" => printf(ex, ctx, args),
         "command" => command(ex, ctx, args),
+        "umask" => umask(ex, ctx, args),
         // `exec` with only redirects rewires the shell itself for the rest
         // of the invocation (the redirects were already applied into this
         // ctx); with a command it replaces the shell: run it, then the
@@ -720,6 +721,47 @@ fn cd(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
             Ok(1)
         }
     }
+}
+
+/// `umask [-S] [mode]` — query or set the file-creation mask. No arg
+/// prints the current mask (bash's default `%04o` form, e.g. `0022`); `-S`
+/// prints the symbolic form bash uses (`u=rwx,g=rx,o=rx`).
+fn umask(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    let symbolic = args.first().map(String::as_str) == Some("-S");
+    let rest = if symbolic { &args[1..] } else { args };
+    match rest.first() {
+        None => {
+            if symbolic {
+                ctx.write_out(&format!("{}\n", symbolic_umask(ex.state.umask)));
+            } else {
+                ctx.write_out(&format!("{:04o}\n", ex.state.umask));
+            }
+            Ok(0)
+        }
+        Some(m) => match u32::from_str_radix(m, 8) {
+            Ok(v) if v <= 0o777 => {
+                ex.state.umask = v;
+                Ok(0)
+            }
+            _ => {
+                ctx.write_err(&format!("bash-walker: umask: {m}: octal number out of range\n"));
+                Ok(1)
+            }
+        },
+    }
+}
+
+fn symbolic_umask(mask: u32) -> String {
+    let perm = |shift: u32| {
+        let bits = 0o7 & !(mask >> shift);
+        format!(
+            "{}{}{}",
+            if bits & 0b100 != 0 { "r" } else { "" },
+            if bits & 0b010 != 0 { "w" } else { "" },
+            if bits & 0b001 != 0 { "x" } else { "" },
+        )
+    };
+    format!("u={},g={},o={}", perm(6), perm(3), perm(0))
 }
 
 fn set(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
