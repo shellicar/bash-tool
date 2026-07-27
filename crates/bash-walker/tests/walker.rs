@@ -803,6 +803,45 @@ fn empty_dollar_substitution_expands_to_nothing() {
 }
 
 #[test]
+fn stderr_merged_into_a_pipe_reaches_the_consumer() {
+    // The dominant 10% sequence-replay divergence: `cmd 2>&1 | grep` must
+    // merge stderr into the PIPE (bash wires the pipe before redirects);
+    // applying redirects first sent stderr around the filter.
+    let (output, status) = run("ls /definitely-does-not-exist-bw 2>&1 | grep -c 'No such'");
+
+    assert_eq!(status, 0);
+    assert_eq!(output.trim(), "1");
+}
+
+#[test]
+fn command_not_found_respects_a_stderr_redirect() {
+    let (output, status) = run("definitely-not-a-command-bw 2>/dev/null; echo rc=$?");
+
+    assert_eq!(status, 0);
+    assert_eq!(output, "rc=127\n");
+}
+
+#[test]
+fn missing_path_says_no_such_file_like_bash() {
+    let (output, status) = run("./no/such/binary-bw");
+
+    assert_eq!(status, 127);
+    assert!(
+        output.contains("No such file or directory"),
+        "output: {output:?}"
+    );
+}
+
+#[test]
+fn signal_death_prints_bash_epitaph_and_status() {
+    let (output, status) = run("sh -c 'kill -ABRT $$'; echo rc=$?");
+
+    assert_eq!(status, 0);
+    assert!(output.contains("Aborted"), "output: {output:?}");
+    assert!(output.contains("rc=134"), "output: {output:?}");
+}
+
+#[test]
 fn syntax_error_reports_status_2() {
     let (output, status) = run("if true; then");
 

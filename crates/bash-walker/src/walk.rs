@@ -290,16 +290,28 @@ impl<'a> Exec<'a> {
             // A stage is a subshell: cloned state, so its cd/vars stay its own.
             let mut stage_state = self.state.clone();
 
-            // An external simple command spawns and stays concurrent.
+            // An external simple command spawns and stays concurrent. The
+            // pipe is wired into the stage ctx BEFORE its redirects apply,
+            // exactly like bash: `cmd 2>&1 | grep` must merge stderr into
+            // the PIPE, not the surrounding output. (Applying redirects
+            // first sent django's stderr around grep — the dominant class
+            // of the 10% sequence-replay divergences.)
             if let Command::Simple(s) = stage {
                 let mut sub = Exec { state: &mut stage_state, shared: &mut *self.shared };
                 match sub.prepare_simple(s, ctx)? {
                     Prepared::External { fields, assigns, redirects } => {
-                        let stage_ctx =
+                        let mut stage_ctx =
                             Ctx { stdin: stage_stdin, derived: true, ..ctx.clone() };
+                        let mut reader: Option<File> = None;
+                        if !last {
+                            let (r, w) =
+                                std::io::pipe().map_err(|e| Flow::Fatal(e.to_string()))?;
+                            stage_ctx.stdout = Arc::new(File::from(std::os::fd::OwnedFd::from(w)));
+                            reader = Some(File::from(std::os::fd::OwnedFd::from(r)));
+                        }
                         let stage_ctx = match sub.apply_redirects(&redirects, &stage_ctx) {
                             Err(Flow::RedirectFailed(msg)) => {
-                                ctx.write_err(&format!("bash-walker: {msg}\n"));
+                                stage_ctx.write_err(&format!("bash-walker: {msg}\n"));
                                 statuses[i] = Some(1);
                                 waiting.push(None);
                                 if !last {
@@ -311,31 +323,17 @@ impl<'a> Exec<'a> {
                             }
                             other => other?,
                         };
-                        let stdout_to = if last {
-                            SpawnOut::Ctx
-                        } else {
-                            SpawnOut::Pipe
-                        };
-                        let mut child =
-                            sub.spawn(&fields, &assigns, &stage_ctx, stdout_to, ctx)?;
-                        match child.take() {
-                            SpawnResult::Child(mut ch) => {
-                                if !last {
-                                    let out = ch.stdout.take().expect("stdout was piped");
-                                    next_stdin =
-                                        Some(Arc::new(File::from(std::os::fd::OwnedFd::from(out))));
-                                }
+                        match sub.spawn(&fields, &assigns, &stage_ctx)?.take() {
+                            SpawnResult::Child(ch) => {
                                 waiting.push(Some(ch));
                             }
                             SpawnResult::Failed(st) => {
                                 statuses[i] = Some(st);
                                 waiting.push(None);
-                                if !last {
-                                    // downstream reads EOF
-                                    let empty = sub.anon_temp()?;
-                                    next_stdin = Some(Arc::new(empty));
-                                }
                             }
+                        }
+                        if let Some(r) = reader {
+                            next_stdin = Some(Arc::new(r));
                         }
                         threads.push(None);
                         continue;
@@ -392,11 +390,7 @@ impl<'a> Exec<'a> {
 
         for (i, slot) in waiting.iter_mut().enumerate() {
             if let Some(child) = slot {
-                let st = child
-                    .wait()
-                    .map(|s| s.code().unwrap_or(128 + s_signal(&s)))
-                    .unwrap_or(1);
-                statuses[i] = Some(st);
+                statuses[i] = Some(wait_reporting(child, ctx));
             }
         }
         for (i, slot) in threads.iter_mut().enumerate() {
@@ -605,26 +599,30 @@ impl<'a> Exec<'a> {
             let stage_stdin = if i == 0 { None } else { next_stdin.take() };
             match sub.prepare_simple(s, ctx)? {
                 Prepared::External { fields, assigns, redirects } => {
-                    let stage_ctx = Ctx { stdin: stage_stdin, derived: true, ..ctx.clone() };
+                    let mut stage_ctx =
+                        Ctx { stdin: stage_stdin, derived: true, ..ctx.clone() };
+                    let mut reader: Option<File> = None;
+                    if !last {
+                        let (r, w) = std::io::pipe().map_err(|e| Flow::Fatal(e.to_string()))?;
+                        stage_ctx.stdout = Arc::new(File::from(std::os::fd::OwnedFd::from(w)));
+                        reader = Some(File::from(std::os::fd::OwnedFd::from(r)));
+                    }
                     let stage_ctx = match sub.apply_redirects(&redirects, &stage_ctx) {
                         Err(Flow::RedirectFailed(msg)) => {
-                            ctx.write_err(&format!("bash-walker: {msg}\n"));
+                            stage_ctx.write_err(&format!("bash-walker: {msg}\n"));
                             continue;
                         }
                         other => other?,
                     };
-                    let out = if last { SpawnOut::Ctx } else { SpawnOut::Pipe };
-                    match sub.spawn(&fields, &assigns, &stage_ctx, out, ctx)?.take() {
-                        SpawnResult::Child(mut ch) => {
-                            if !last {
-                                let o = ch.stdout.take().expect("stdout was piped");
-                                next_stdin =
-                                    Some(Arc::new(File::from(std::os::fd::OwnedFd::from(o))));
-                            }
+                    match sub.spawn(&fields, &assigns, &stage_ctx)?.take() {
+                        SpawnResult::Child(ch) => {
                             last_pid = Some(ch.id());
                             sub.shared.bg.push(ch);
                         }
                         SpawnResult::Failed(_) => {}
+                    }
+                    if let Some(r) = reader {
+                        next_stdin = Some(Arc::new(r));
                     }
                 }
                 Prepared::Internal => {
@@ -770,11 +768,8 @@ impl<'a> Exec<'a> {
                 builtins::run(ex, &ctx2, &name, args)
             });
         }
-        match self.spawn(&fields, &assigns, &ctx2, SpawnOut::Ctx, ctx)?.take() {
-            SpawnResult::Child(mut ch) => Ok(ch
-                .wait()
-                .map(|st| st.code().unwrap_or(128 + s_signal(&st)))
-                .unwrap_or(1)),
+        match self.spawn(&fields, &assigns, &ctx2)?.take() {
+            SpawnResult::Child(mut ch) => Ok(wait_reporting(&mut ch, &ctx2)),
             SpawnResult::Failed(st) => Ok(st),
         }
     }
@@ -782,11 +777,8 @@ impl<'a> Exec<'a> {
     /// Spawn one external command and wait — the `exec cmd` path, where the
     /// command's status becomes the shell's exit status.
     pub(crate) fn run_external_wait(&mut self, fields: &[String], ctx: &Ctx) -> Result<i32, Flow> {
-        match self.spawn(fields, &[], ctx, SpawnOut::Ctx, ctx)?.take() {
-            SpawnResult::Child(mut ch) => Ok(ch
-                .wait()
-                .map(|st| st.code().unwrap_or(128 + s_signal(&st)))
-                .unwrap_or(1)),
+        match self.spawn(fields, &[], ctx)?.take() {
+            SpawnResult::Child(mut ch) => Ok(wait_reporting(&mut ch, ctx)),
             SpawnResult::Failed(st) => Ok(st),
         }
     }
@@ -833,13 +825,13 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// Errors report to THIS ctx — the command's own (redirected) stderr,
+    /// so `missing-cmd 2>/dev/null` stays silent, as under bash.
     fn spawn(
         &mut self,
         fields: &[String],
         assigns: &[(String, String)],
         ctx: &Ctx,
-        out: SpawnOut,
-        report_ctx: &Ctx,
     ) -> Result<SpawnSlot, Flow> {
         let mut cmd = Proc::new(&fields[0]);
         cmd.args(&fields[1..]);
@@ -856,14 +848,11 @@ impl<'a> Exec<'a> {
             Some(f) => Stdio::from(f.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?),
             None => Stdio::null(),
         });
-        cmd.stdout(match out {
-            SpawnOut::Ctx => Stdio::from(
-                ctx.stdout
-                    .try_clone()
-                    .map_err(|e| Flow::Fatal(e.to_string()))?,
-            ),
-            SpawnOut::Pipe => Stdio::piped(),
-        });
+        cmd.stdout(Stdio::from(
+            ctx.stdout
+                .try_clone()
+                .map_err(|e| Flow::Fatal(e.to_string()))?,
+        ));
         cmd.stderr(Stdio::from(
             ctx.stderr
                 .try_clone()
@@ -893,15 +882,24 @@ impl<'a> Exec<'a> {
         match cmd.spawn() {
             Ok(ch) => Ok(SpawnSlot(Some(SpawnResult::Child(ch)))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                report_ctx.write_err(&format!("bash-walker: {}: command not found\n", fields[0]));
+                // bash's dialect: a path is "No such file or directory", a
+                // PATH lookup miss is "command not found". Agents read these.
+                if fields[0].contains('/') {
+                    ctx.write_err(&format!(
+                        "bash-walker: {}: No such file or directory\n",
+                        fields[0]
+                    ));
+                } else {
+                    ctx.write_err(&format!("bash-walker: {}: command not found\n", fields[0]));
+                }
                 Ok(SpawnSlot(Some(SpawnResult::Failed(127))))
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                report_ctx.write_err(&format!("bash-walker: {}: permission denied\n", fields[0]));
+                ctx.write_err(&format!("bash-walker: {}: Permission denied\n", fields[0]));
                 Ok(SpawnSlot(Some(SpawnResult::Failed(126))))
             }
             Err(e) => {
-                report_ctx.write_err(&format!("bash-walker: {}: {e}\n", fields[0]));
+                ctx.write_err(&format!("bash-walker: {}: {e}\n", fields[0]));
                 Ok(SpawnSlot(Some(SpawnResult::Failed(1))))
             }
         }
@@ -1044,11 +1042,6 @@ enum Prepared {
     Internal,
 }
 
-enum SpawnOut {
-    Ctx,
-    Pipe,
-}
-
 enum SpawnResult {
     Child(Child),
     Failed(i32),
@@ -1094,6 +1087,39 @@ pub fn errmsg(e: &std::io::Error) -> String {
 fn s_signal(st: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     st.signal().unwrap_or(0)
+}
+
+/// Wait for a child; a signal death gets bash's epitaph on stderr
+/// ("Aborted", "Segmentation fault", ...) — SIGPIPE dies silently, as in
+/// bash — and the status is 128+signal either way.
+fn wait_reporting(child: &mut Child, ctx: &Ctx) -> i32 {
+    match child.wait() {
+        Ok(st) => match st.code() {
+            Some(c) => c,
+            None => {
+                let sig = s_signal(&st);
+                if let Some(msg) = signal_epitaph(sig) {
+                    ctx.write_err(&format!("{msg}\n"));
+                }
+                128 + sig
+            }
+        },
+        Err(_) => 1,
+    }
+}
+
+fn signal_epitaph(sig: i32) -> Option<&'static str> {
+    match sig {
+        4 => Some("Illegal instruction"),
+        5 => Some("Trace/breakpoint trap"),
+        6 => Some("Aborted"),
+        7 => Some("Bus error"),
+        8 => Some("Floating point exception"),
+        9 => Some("Killed"),
+        11 => Some("Segmentation fault"),
+        15 => Some("Terminated"),
+        _ => None,
+    }
 }
 
 fn flatten_pipeline(cmd: &Command, out: &mut Vec<Command>) {
