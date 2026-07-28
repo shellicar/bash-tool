@@ -951,6 +951,47 @@ fn pipestatus_for_a_lone_simple_command() {
 }
 
 #[test]
+fn quoted_at_with_empty_positional_array_contributes_no_argument() {
+    // Found live: a function shifted its positional params to empty, then
+    // called `$BIN "$@" file` — the real program received a phantom empty
+    // argument and rejected it. `"$@"` with zero elements must vanish
+    // entirely, unlike an ordinary quoted empty string `""`.
+    let (output, _) = run("f() { printf '[%s]' \"$@\" end; }; f");
+
+    let expected = "[end]";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn quoted_at_with_arguments_still_splits_one_field_per_argument() {
+    let (output, _) = run("f() { printf '[%s]' \"$@\"; }; f a b c");
+
+    let expected = "[a][b][c]";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn ordinary_quoted_empty_string_still_produces_one_field() {
+    let (output, _) = run("printf '[%s]' \"\" end");
+
+    let expected = "[][end]";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn glob_ending_in_slash_keeps_the_trailing_slash() {
+    // Found by sequence replay: `ls tests/model_inheritance*/` gave ls a
+    // directory header without the trailing slash bash's own glob keeps
+    // (the pattern explicitly asked for directories only).
+    let d = temp_dir("trailing-slash");
+    std::fs::create_dir(d.join("sub")).unwrap();
+    let (output, _) = run(&format!("echo {}/su*/", d.display()));
+
+    let expected = format!("{}/sub/\n", d.display());
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn syntax_error_reports_status_2() {
     let (output, status) = run("if true; then");
 

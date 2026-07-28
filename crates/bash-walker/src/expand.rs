@@ -236,6 +236,11 @@ fn glob_field(text: &str, pattern: &str, cwd: &std::path::Path) -> Vec<String> {
             // its result paths — found live: `./hugolib/*.go` matched, but
             // came back without the `./` bash itself keeps. Restore it.
             let leading_dotslash = pattern.starts_with("./");
+            // A pattern ending in `/` explicitly asks for directories only,
+            // and bash preserves that literal trailing slash in each match
+            // (so `ls dir*/` prints "dir/:" headers) — the glob crate's
+            // PathBuf round-trip drops it. Restore it too.
+            let trailing_slash = pattern.ends_with('/');
             let matches: Vec<String> = paths
                 .filter_map(Result::ok)
                 .map(|p: PathBuf| {
@@ -249,6 +254,13 @@ fn glob_field(text: &str, pattern: &str, cwd: &std::path::Path) -> Vec<String> {
                 .map(|s| {
                     if leading_dotslash && !s.starts_with("./") {
                         format!("./{s}")
+                    } else {
+                        s
+                    }
+                })
+                .map(|s| {
+                    if trailing_slash && !s.ends_with('/') {
+                        format!("{s}/")
                     } else {
                         s
                     }
@@ -479,6 +491,15 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
             b'"' => {
                 i += 1;
                 let mut lit = String::new();
+                // Bare `"$@"` (or `"${@}"`/`"$*"`) with an EMPTY positional
+                // array must contribute NO field at all — not one empty
+                // string. Found live: `t(){ ...; shift 2; $BIN "$@" f; }`
+                // with no args left passed a phantom empty arg, which the
+                // real program then rejected as "a value was not supplied".
+                // Only the bare case is special-cased; any OTHER content in
+                // the same quotes falls back to ordinary concatenation.
+                let mut saw_other_content = false;
+                let mut saw_empty_positional = false;
                 while i < b.len() && b[i] != b'"' {
                     match b[i] {
                         b'\\' if i + 1 < b.len()
@@ -504,6 +525,9 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                                     i = next;
                                 }
                                 (Expanded::Many(vals), next) => {
+                                    if vals.is_empty() {
+                                        saw_empty_positional = true;
+                                    }
                                     // "$@": each value its own field, joined
                                     // to whatever literal text surrounds it.
                                     for (k, v) in vals.iter().enumerate() {
@@ -520,6 +544,7 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                                 (Expanded::NotSpecial, _) => {
                                     lit.push(b[i] as char);
                                     i += 1;
+                                    saw_other_content = true;
                                 }
                             }
                         }
@@ -530,11 +555,16 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                             while i < b.len() && !matches!(b[i], b'"' | b'\\' | b'$' | b'`') {
                                 i += 1;
                             }
+                            if start != i {
+                                saw_other_content = true;
+                            }
                             lit.push_str(&raw[start..i]);
                         }
                     }
                 }
-                items.push(Item::Text { s: lit, quoted: true });
+                if !(saw_empty_positional && !saw_other_content && lit.is_empty()) {
+                    items.push(Item::Text { s: lit, quoted: true });
+                }
                 i += 1;
             }
             b'\\' => {
