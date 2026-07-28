@@ -895,6 +895,19 @@ fn umask_persists_across_invocations() {
 }
 
 #[test]
+fn glob_with_a_leading_dotslash_keeps_it_in_the_result() {
+    // Found by sequence replay: `./hugolib/*.go` matched, but the walker's
+    // glob result dropped the `./` bash keeps (the glob crate resolves `.`
+    // as CurDir and drops it while walking).
+    let d = temp_dir("dotslash");
+    std::fs::write(d.join("a.go"), "").unwrap();
+    let (output, _) = run(&format!("cd {} && echo ./*.go", d.display()));
+
+    let expected = "./a.go\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn syntax_error_reports_status_2() {
     let (output, status) = run("if true; then");
 

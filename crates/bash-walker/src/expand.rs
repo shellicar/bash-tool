@@ -230,6 +230,12 @@ fn glob_field(text: &str, pattern: &str, cwd: &std::path::Path) -> Vec<String> {
     };
     match glob::glob_with(&full_pattern, options) {
         Ok(paths) => {
+            // A literal `./` leading the pattern is a real directory entry
+            // to glob(3)/bash (it's how a relative pattern names the cwd),
+            // but the `glob` crate resolves `.` as CurDir and drops it from
+            // its result paths — found live: `./hugolib/*.go` matched, but
+            // came back without the `./` bash itself keeps. Restore it.
+            let leading_dotslash = pattern.starts_with("./");
             let matches: Vec<String> = paths
                 .filter_map(Result::ok)
                 .map(|p: PathBuf| {
@@ -240,6 +246,13 @@ fn glob_field(text: &str, pattern: &str, cwd: &std::path::Path) -> Vec<String> {
                     }
                 })
                 .map(|p| p.to_string_lossy().into_owned())
+                .map(|s| {
+                    if leading_dotslash && !s.starts_with("./") {
+                        format!("./{s}")
+                    } else {
+                        s
+                    }
+                })
                 .collect();
             if matches.is_empty() {
                 vec![text.to_string()]
