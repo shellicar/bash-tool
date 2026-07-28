@@ -488,6 +488,22 @@ fn render_conversion(
                 }
                 0.0
             });
+            // NaN/Infinity: bash prints "nan"/"inf" (case follows the
+            // conversion letter) and never zero-pads them — found live,
+            // the walker printed "NaN" (Rust's Display) and zero-padded it
+            // like an ordinary number under %015f.
+            if v.is_nan() || v.is_infinite() {
+                let word = if v.is_nan() {
+                    "nan"
+                } else if v.is_sign_negative() {
+                    "-inf"
+                } else {
+                    "inf"
+                };
+                let word = if conv.is_uppercase() { word.to_uppercase() } else { word.to_string() };
+                let flags_no_zero: String = flags.chars().filter(|&c| c != '0').collect();
+                return pad_number(out, &word, &flags_no_zero, width);
+            }
             let p = prec.unwrap_or(6);
             let s = match conv {
                 'f' | 'F' => format!("{v:.p$}"),

@@ -908,6 +908,49 @@ fn glob_with_a_leading_dotslash_keeps_it_in_the_result() {
 }
 
 #[test]
+fn printf_f_prints_lowercase_nan_and_inf_never_zero_padded() {
+    let (output, _) = run("printf '[%015f]\\n' nan; printf '[%015f]\\n' inf");
+
+    let expected = "[            nan]\n[            inf]\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn printf_f_uppercase_conversion_gives_uppercase_nan() {
+    let (output, _) = run("printf '[%F]\\n' nan");
+
+    let expected = "[NAN]\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn pipestatus_reports_every_pipeline_stage() {
+    let (output, _) = run("false | true | false; echo ${PIPESTATUS[0]} ${PIPESTATUS[1]} ${PIPESTATUS[2]}");
+
+    let expected = "1 0 1\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn pipestatus_bare_and_at_forms() {
+    // Reading both forms must happen in the SAME command: PIPESTATUS
+    // resets after every simple command (including the `echo` doing the
+    // reading), exactly like bash.
+    let (output, _) = run("false | true; echo $PIPESTATUS ${PIPESTATUS[@]}");
+
+    let expected = "1 1 0\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn pipestatus_for_a_lone_simple_command() {
+    let (output, _) = run("false; echo ${PIPESTATUS[0]}");
+
+    let expected = "1\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn syntax_error_reports_status_2() {
     let (output, status) = run("if true; then");
 

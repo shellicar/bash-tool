@@ -142,6 +142,12 @@ impl<'a> Exec<'a> {
         };
         let status = self.exec_inner(cmd, ctx, tested)?;
         self.state.last_status = status;
+        // `$PIPESTATUS`: a lone simple command is a one-stage pipeline.
+        // `exec_connection`'s Pipe arm overwrites this with the real
+        // per-stage array for an actual `|` chain.
+        if matches!(cmd, Command::Simple(_)) {
+            self.state.pipestatus = vec![status];
+        }
         if status != 0
             && self.state.flags.errexit
             && !tested
@@ -400,6 +406,7 @@ impl<'a> Exec<'a> {
             }
         }
 
+        self.state.pipestatus = statuses.iter().map(|s| s.unwrap_or(1)).collect();
         let final_status = if self.state.flags.pipefail {
             statuses
                 .iter()

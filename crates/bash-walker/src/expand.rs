@@ -883,6 +883,8 @@ fn param_value(ex: &mut Exec, name: &str) -> Result<Expanded, Flow> {
             }
         }
         "RANDOM" => Some(ex.shared.entropy.next_random().to_string()),
+        // Bare $PIPESTATUS (no subscript) is element 0, same as bash.
+        "PIPESTATUS" => Some(ex.state.pipestatus.first().copied().unwrap_or(0).to_string()),
         _ => ex.state.get_var(name),
     };
     match v {
@@ -919,6 +921,25 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
             .map_err(|_| Flow::Fatal(format!("${{{inner}}}: bad subscript")))?;
         return Ok(Expanded::One(
             ex.state.rematch.get(n).cloned().unwrap_or_default(),
+        ));
+    }
+    // PIPESTATUS[n] / PIPESTATUS[@|*] — the last pipeline's per-stage exit
+    // codes. Corpus-backed: `${PIPESTATUS[0]}` is a common idiom for
+    // checking the exit status of a command upstream of a filter/pager.
+    if let Some(idx) = inner
+        .strip_prefix("PIPESTATUS[")
+        .and_then(|r| r.strip_suffix(']'))
+    {
+        if idx == "@" || idx == "*" {
+            return Ok(Expanded::Many(
+                ex.state.pipestatus.iter().map(i32::to_string).collect(),
+            ));
+        }
+        let n: usize = idx
+            .parse()
+            .map_err(|_| Flow::Fatal(format!("${{{inner}}}: bad subscript")))?;
+        return Ok(Expanded::One(
+            ex.state.pipestatus.get(n).map(i32::to_string).unwrap_or_default(),
         ));
     }
 
@@ -1103,7 +1124,7 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
 }
 
 fn is_special(name: &str) -> bool {
-    matches!(name, "?" | "$" | "!" | "#" | "@" | "*" | "-" | "0" | "RANDOM")
+    matches!(name, "?" | "$" | "!" | "#" | "@" | "*" | "-" | "0" | "RANDOM" | "PIPESTATUS")
         || name.chars().all(|c| c.is_ascii_digit())
 }
 

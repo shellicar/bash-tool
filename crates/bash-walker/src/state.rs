@@ -56,6 +56,9 @@ pub struct ShellState {
     pub last_background_pid: Option<u32>,
     /// `[[ =~ ]]`'s capture groups: whole match at 0, groups after.
     pub rematch: Vec<String>,
+    /// `$PIPESTATUS`: the exit status of each stage of the most recently
+    /// executed pipeline (a lone simple command counts as one stage).
+    pub pipestatus: Vec<i32>,
     /// The shell's working directory — state threaded to every use site
     /// (spawns, redirects, globs, file tests), never the process cwd.
     /// `cd` is a mutation of this field; nothing ever calls chdir.
@@ -98,6 +101,7 @@ impl Default for ShellState {
             last_status: 0,
             last_background_pid: None,
             rematch: Vec::new(),
+            pipestatus: vec![0],
             cwd,
             umask,
         }
