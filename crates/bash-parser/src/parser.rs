@@ -98,43 +98,55 @@ impl<'a> Parser<'a> {
     /// `}`) inside a compound body, a case-arm terminator inside `case`.
     fn parse_command_list(&mut self, is_end: impl Fn(&Token) -> bool) -> Result<Command, ParseError> {
         self.skip_newlines()?;
-        let mut cmd = self.parse_and_or()?;
+        // `folded` is every element already terminated; `element` is the one
+        // the next `;`, `&` or newline terminates. They are kept apart because
+        // `&` backgrounds the element it follows and nothing else: bash runs
+        // `a; b & c` as a, then b in the background, then c. Backgrounding the
+        // whole accumulated sequence instead swept a's output and state into a
+        // detached child the shell never waits for.
+        let mut folded: Option<Command> = None;
+        let mut element = self.parse_and_or()?;
         loop {
             if is_end(self.peek()?) {
                 break;
             }
             match self.peek()? {
                 Token::Semi | Token::Amp => {
-                    let background = matches!(self.peek()?, Token::Amp);
+                    if matches!(self.peek()?, Token::Amp) {
+                        element = Command::Background(Box::new(element));
+                    }
                     self.advance()?;
                     self.skip_newlines()?;
                     if is_end(self.peek()?) {
-                        if background {
-                            // trailing `&`: applies to what's already parsed
-                            cmd = Command::Background(Box::new(cmd));
-                        }
                         break;
                     }
-                    let right = self.parse_and_or()?;
-                    let connector = if background { Connector::SeqAsync } else { Connector::Seq };
-                    cmd = Command::Connection(Connection { left: Box::new(cmd), right: Box::new(right), connector });
+                    folded = Some(Self::join_sequence(folded, element));
+                    element = self.parse_and_or()?;
                 }
                 Token::Newline => {
                     self.skip_newlines()?;
                     if is_end(self.peek()?) {
                         break;
                     }
-                    let right = self.parse_and_or()?;
-                    cmd = Command::Connection(Connection {
-                        left: Box::new(cmd),
-                        right: Box::new(right),
-                        connector: Connector::Seq,
-                    });
+                    folded = Some(Self::join_sequence(folded, element));
+                    element = self.parse_and_or()?;
                 }
                 other => return Err(ParseError::Unexpected(format!("{other:?}"))),
             }
         }
-        Ok(cmd)
+        Ok(Self::join_sequence(folded, element))
+    }
+
+    /// `;` chains left-leaning, the same shape as bash's own `cm_connection`.
+    fn join_sequence(folded: Option<Command>, element: Command) -> Command {
+        match folded {
+            Some(left) => Command::Connection(Connection {
+                left: Box::new(left),
+                right: Box::new(element),
+                connector: Connector::Seq,
+            }),
+            None => element,
+        }
     }
 
     /// `&&` / `||` — left-associative, both bind looser than `|`.
@@ -888,6 +900,31 @@ mod tests {
     fn trailing_ampersand_is_a_background_command() {
         let cmd = parse("sleep 5 &").unwrap();
         assert!(matches!(cmd, Command::Background(_)));
+    }
+
+    #[test]
+    fn ampersand_backgrounds_only_the_element_before_it() {
+        let cmd = parse("echo before; sleep 1 & echo after").unwrap();
+        match cmd {
+            Command::Connection(Connection { connector: Connector::Seq, left, .. }) => match *left {
+                Command::Connection(Connection { connector: Connector::Seq, right, .. }) => {
+                    assert!(matches!(*right, Command::Background(_)));
+                }
+                other => panic!("expected the first two elements joined by ;, got {other:?}"),
+            },
+            other => panic!("expected a ; sequence at the top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_command_before_a_trailing_ampersand_stays_in_the_foreground() {
+        let cmd = parse("echo a; sleep 5 &").unwrap();
+        match cmd {
+            Command::Connection(Connection { connector: Connector::Seq, left, .. }) => {
+                assert!(matches!(*left, Command::Simple(_)));
+            }
+            other => panic!("expected `echo a` outside the background job, got {other:?}"),
+        }
     }
 
     #[test]

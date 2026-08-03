@@ -84,7 +84,6 @@ fn connector_label(c: Connector) -> &'static str {
         Connector::And => "&&",
         Connector::Or => "||",
         Connector::Seq => ";",
-        Connector::SeqAsync => "&",
         Connector::Pipe => "|",
     }
 }

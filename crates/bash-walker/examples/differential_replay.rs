@@ -22,7 +22,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Proc, Stdio};
 
-use bash_parser::{Command, CondExpr, Connection, Connector, Redirect, RedirectOp, SimpleCommand, Word};
+use bash_parser::{Command, CondExpr, Connection, Redirect, RedirectOp, SimpleCommand, Word};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -432,7 +432,6 @@ fn collect_arith_assigned(expr: &str, out: &mut HashSet<String>) {
 fn is_pure(cmd: &Command, assigned: &HashSet<String>, mode: Mode) -> bool {
     match cmd {
         Command::Simple(s) => simple_is_pure(s, assigned, mode),
-        Command::Connection(Connection { connector: Connector::SeqAsync, .. }) => false,
         Command::Connection(Connection { left, right, .. }) => {
             is_pure(left, assigned, mode) && is_pure(right, assigned, mode)
         }

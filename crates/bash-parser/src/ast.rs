@@ -20,8 +20,7 @@ pub struct Word {
 pub enum Connector {
     And,      // &&
     Or,       // ||
-    Seq,      // ;
-    SeqAsync, // &  (background — deliberately unimplemented at the walker level for now)
+    Seq,      // ;  and `&`, whose own element is wrapped in Command::Background
     Pipe,     // |
 }
 
@@ -147,9 +146,10 @@ pub enum Command {
     /// `time [pipeline]` — bash's `CMD_TIME_PIPELINE` flag, same wrapper
     /// treatment as `Invert`.
     Time(Box<Command>),
-    /// A trailing `&` with nothing after it: `sleep 5 &`. `a & b` stays a
-    /// `Connection` with `Connector::SeqAsync` (bash: connection node with
-    /// a null right child; here a distinct wrapper).
+    /// The element a `&` follows: the whole of `sleep 5 &`, and the `b` alone
+    /// in `a; b & c`. `&` binds to its own element and never to the sequence
+    /// around it, so that sequence stays ordinary `;` connections holding this
+    /// wrapper.
     Background(Box<Command>),
     /// Redirects after a compound command's closer: `{ cmds; } > file`,
     /// `done < input`. Bash threads a `redirects` list through every

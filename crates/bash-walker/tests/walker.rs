@@ -998,3 +998,21 @@ fn syntax_error_reports_status_2() {
     assert_eq!(status, 2);
     assert!(output.contains("syntax error"), "output: {output:?}");
 }
+
+#[test]
+fn a_command_before_an_ampersand_runs_in_this_shell() {
+    let expected = "[1]\n";
+
+    let (actual, _) = run("x=1; x=2 & echo \"[$x]\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn output_before_an_ampersand_is_not_lost() {
+    let expected = "before\nafter\n";
+
+    let (actual, _) = run("echo before; sleep 1 & echo after");
+
+    assert_eq!(actual, expected);
+}

@@ -260,10 +260,6 @@ impl<'a> Exec<'a> {
                 self.exec(&c.left, ctx, tested)?;
                 self.exec(&c.right, ctx, tested)
             }
-            Connector::SeqAsync => {
-                self.exec_background(&c.left, ctx)?;
-                self.exec(&c.right, ctx, tested)
-            }
             Connector::Pipe => {
                 let mut stages = Vec::new();
                 flatten_pipeline(&Command::Connection(c.clone()), &mut stages);
