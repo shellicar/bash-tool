@@ -1016,3 +1016,78 @@ fn output_before_an_ampersand_is_not_lost() {
 
     assert_eq!(actual, expected);
 }
+
+/// The `set -x` trace, which is what the shell decided rather than what the
+/// programs it ran printed. Every expectation below is bash 5.3's own output
+/// for the same script, captured and pinned; matching it is the point, so a
+/// difference is a walker bug by definition.
+fn trace(src: &str) -> String {
+    let (out, _) = run(src);
+    out.lines()
+        .filter(|l| l.starts_with('+'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn xtrace_quotes_a_word_that_would_not_survive_being_read_back() {
+    let expected = "+ echo 'has'\\''quote' 'has$dollar' '' 'a b' plain";
+
+    let actual = trace("set -x\necho \"has'quote\" 'has$dollar' \"\" \"a b\" plain");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_reports_an_assignment_with_only_its_value_quoted() {
+    let expected = "+ x=1\n+ y='a b'";
+
+    let actual = trace("set -x\nx=1\ny=\"a b\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_reports_a_command_prefix_assignment_on_its_own_line() {
+    let expected = "+ foo=bar\n+ echo prefixed";
+
+    let actual = trace("set -x\nfoo=bar echo prefixed");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_marks_one_level_per_substitution_innermost_first() {
+    let expected = "+++ echo deeper\n++ echo nested deeper\n+ echo nested deeper";
+
+    let actual = trace("set -x\necho $(echo nested $(echo deeper))");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_repeats_the_loop_header_on_every_iteration() {
+    let expected = "+ for i in 1 2\n+ echo 'loop 1'\n+ for i in 1 2\n+ echo 'loop 2'";
+
+    let actual = trace("set -x\nfor i in 1 2; do echo \"loop $i\"; done");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_reports_the_case_header_with_its_subject_expanded() {
+    let expected = "+ subject=abc\n+ case abc in\n+ echo matched";
+
+    let actual = trace("set -x\nsubject=abc\ncase $subject in\n  a*) echo matched ;;\nesac");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_shows_a_failed_glob_staying_literal() {
+    let expected = "+ echo '*.nomatch'";
+
+    let actual = trace("set -x\necho *.nomatch");
+
+    assert_eq!(actual, expected);
+}

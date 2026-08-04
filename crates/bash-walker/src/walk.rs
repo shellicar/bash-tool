@@ -77,6 +77,10 @@ pub struct Shared {
     pub procsub_temps: Vec<PathBuf>,
     pub func_depth: u32,
     pub loop_depth: u32,
+    /// How deep inside `$(...)` we are. Bash marks trace lines with one `+`
+    /// per level, so the trace shows a substitution running before the
+    /// command that asked for it.
+    pub subst_depth: u32,
     /// Status of the most recent command substitution — an assignment-only
     /// command's status in bash (`x=$(false); echo $?` is 1).
     pub last_capture_status: Option<i32>,
@@ -95,6 +99,7 @@ impl Default for Shared {
             procsub_temps: Vec::new(),
             func_depth: 0,
             loop_depth: 0,
+            subst_depth: 0,
             last_capture_status: None,
             persistent_ctx: None,
             clock: Arc::new(crate::clock::RealClock::default()),
@@ -303,6 +308,13 @@ impl<'a> Exec<'a> {
                 let mut sub = Exec { state: &mut stage_state, shared: &mut *self.shared };
                 match sub.prepare_simple(s, ctx)? {
                     Prepared::External { fields, assigns, redirects } => {
+                        // Every stage is traced, not just the first: half a
+                        // pipeline is worse than none. Written to the outer
+                        // ctx so the trace never enters the pipe.
+                        for (k, v) in &assigns {
+                            sub.xtrace_assign(ctx, k, v);
+                        }
+                        sub.xtrace(ctx, &fields);
                         let mut stage_ctx =
                             Ctx { stdin: stage_stdin, derived: true, ..ctx.clone() };
                         let mut reader: Option<File> = None;
@@ -371,8 +383,11 @@ impl<'a> Exec<'a> {
             let stage_cmd = stage.clone();
             let clock = Arc::clone(&self.shared.clock);
             let entropy = Arc::clone(&self.shared.entropy);
+            // A stage inherits how deep in `$(...)` the pipeline itself is, or
+            // a substitution inside a stage would trace one level too shallow.
+            let subst_depth = self.shared.subst_depth;
             let handle = std::thread::spawn(move || -> i32 {
-                let mut shared = Shared { clock, entropy, ..Shared::default() };
+                let mut shared = Shared { clock, entropy, subst_depth, ..Shared::default() };
                 let mut sub = Exec { state: &mut stage_state, shared: &mut shared };
                 match sub.exec(&stage_cmd, &stage_ctx, true) {
                     Ok(st) => st,
@@ -473,7 +488,12 @@ impl<'a> Exec<'a> {
         let mut status = 0;
         self.shared.loop_depth += 1;
         let mut result = Ok(());
+        // Bash re-traces the loop header on every iteration, with the word
+        // list already expanded.
+        let mut header = vec!["for".to_string(), var.to_string(), "in".to_string()];
+        header.extend(values.iter().cloned());
         for v in values {
+            self.xtrace(ctx, &header);
             self.state.set_var(var, v.clone());
             match self.exec(body, ctx, false) {
                 Ok(st) => status = st,
@@ -537,6 +557,8 @@ impl<'a> Exec<'a> {
 
     fn exec_case(&mut self, c: &bash_parser::CaseCommand, ctx: &Ctx) -> Result<i32, Flow> {
         let subject = expand::expand_single(self, ctx, &c.word)?;
+        // Bash traces the header once, with the subject already expanded.
+        self.xtrace(ctx, &["case".to_string(), subject.clone(), "in".to_string()]);
         let mut status = 0;
         let mut fell_through = false;
         for arm in &c.arms {
@@ -753,14 +775,18 @@ impl<'a> Exec<'a> {
 
         if fields.is_empty() {
             for (k, v) in assigns {
+                self.xtrace_assign(&ctx2, &k, &v);
                 self.state.set_var(&k, v);
             }
             return Ok(self.shared.last_capture_status.unwrap_or(0));
         }
 
-        if self.state.flags.xtrace {
-            ctx2.write_err(&format!("+ {}\n", fields.join(" ")));
+        // Bash traces a command's own assignments as separate lines ahead of
+        // it, so `foo=bar cmd` is two lines, not one.
+        for (k, v) in &assigns {
+            self.xtrace_assign(&ctx2, k, v);
         }
+        self.xtrace(&ctx2, &fields);
 
         let name = fields[0].clone();
         let args = &fields[1..];
@@ -777,6 +803,27 @@ impl<'a> Exec<'a> {
             SpawnResult::Child(mut ch) => Ok(wait_reporting(&mut ch, &ctx2)),
             SpawnResult::Failed(st) => Ok(st),
         }
+    }
+
+    /// One `set -x` line: `+` per substitution level, then the words as bash
+    /// prints them. The quoting is the point of the trace, since `echo "a b"`
+    /// and `echo a b` are the same characters and different commands.
+    fn xtrace(&self, ctx: &Ctx, words: &[String]) {
+        if !self.state.flags.xtrace {
+            return;
+        }
+        let marks = "+".repeat(1 + self.shared.subst_depth as usize);
+        let line: Vec<String> = words.iter().map(|w| xtrace_quote(w)).collect();
+        ctx.write_err(&format!("{marks} {}\n", line.join(" ")));
+    }
+
+    /// An assignment traces as `name=value` with only the value quoted.
+    fn xtrace_assign(&self, ctx: &Ctx, name: &str, value: &str) {
+        if !self.state.flags.xtrace {
+            return;
+        }
+        let marks = "+".repeat(1 + self.shared.subst_depth as usize);
+        ctx.write_err(&format!("{marks} {name}={}\n", xtrace_quote(value)));
     }
 
     /// Spawn one external command and wait — the `exec cmd` path, where the
@@ -1152,6 +1199,20 @@ fn flatten_pipeline(cmd: &Command, out: &mut Vec<Command>) {
     }
 }
 
+/// Bash's `set -x` quoting: a word prints bare when it would survive being
+/// read back, and in single quotes otherwise, with an embedded quote closed
+/// and reopened as `'\''`. An empty word prints as `''`, which is how the
+/// trace shows a field that exists and holds nothing.
+fn xtrace_quote(word: &str) -> String {
+    if word.is_empty() {
+        return "''".to_string();
+    }
+    if word.chars().all(|c| c.is_ascii_alphanumeric() || "_./-+=:@%,^".contains(c)) {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 /// Parse and execute a source string in the current shell (top level, the
 /// `eval`/`source` builtins, and substitution interiors).
 pub fn run_source(ex: &mut Exec, ctx: &Ctx, src: &str, tested: bool) -> Result<i32, Flow> {
@@ -1169,6 +1230,13 @@ pub fn run_source(ex: &mut Exec, ctx: &Ctx, src: &str, tested: bool) -> Result<i
 /// `$(...)`: run in a subshell, capture stdout, report the status back for
 /// `$?` and assignment-only commands.
 pub fn run_capture(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> {
+    ex.shared.subst_depth += 1;
+    let r = run_capture_inner(ex, ctx, src);
+    ex.shared.subst_depth -= 1;
+    r
+}
+
+fn run_capture_inner(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow> {
     let capture = ex.anon_temp()?;
     let handle = capture.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?;
     let saved_pctx = ex.shared.persistent_ctx.clone();
