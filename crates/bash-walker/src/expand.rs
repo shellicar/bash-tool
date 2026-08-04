@@ -727,7 +727,6 @@ fn ansi_c_quote(raw: &str, quote_start: usize) -> (String, usize) {
                 b'\\' => ('\\', 2),
                 b'\'' => ('\'', 2),
                 b'"' => ('"', 2),
-                b'0' => ('\0', 2),
                 b'a' => ('\x07', 2),
                 b'b' => ('\x08', 2),
                 b'e' => ('\x1b', 2),
@@ -741,6 +740,15 @@ fn ansi_c_quote(raw: &str, quote_start: usize) -> (String, usize) {
                         .collect();
                     let v = u8::from_str_radix(&hex, 16).unwrap_or(b'x');
                     (v as char, 2 + hex.len())
+                }
+                // `\nnn` is up to three octal digits, and `\0` is only NUL
+                // because zero digits follow it. Treating `\0` as its own
+                // escape left the digits behind as text, so `$'soh\001'`
+                // became NUL then "01".
+                b'0'..=b'7' => {
+                    let oct: String = raw[i + 1..].chars().take_while(|c| ('0'..='7').contains(c)).take(3).collect();
+                    let v = u32::from_str_radix(&oct, 8).unwrap_or(0);
+                    (char::from_u32(v).unwrap_or('\0'), 1 + oct.len())
                 }
                 other => (other as char, 2),
             };

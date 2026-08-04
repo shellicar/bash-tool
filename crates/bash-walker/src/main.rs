@@ -32,7 +32,7 @@ fn errmsg(e: &std::io::Error) -> String {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let mut path: Option<PathBuf> = std::env::var("BASH_WALKER_STATE").ok().map(PathBuf::from);
+    let mut path_state: Option<PathBuf> = std::env::var("BASH_WALKER_STATE").ok().map(PathBuf::from);
     let mut mode = bash_walker::state::Persist::All;
     if let Some(first) = args.first() {
         if first == "--state" || first == "--state-cwd" {
@@ -43,11 +43,11 @@ fn main() {
                 eprintln!("bash-walker: {first} requires a file path argument");
                 std::process::exit(2);
             };
-            path = Some(PathBuf::from(p));
+            path_state = Some(PathBuf::from(p));
             args.drain(..2);
         }
     }
-    let mut state = match &path {
+    let mut state = match &path_state {
         Some(p) => bash_walker::state::load_mode(p, mode),
         None => bash_walker::ShellState::default(),
     };
@@ -125,7 +125,7 @@ fn main() {
             unsafe { std::fs::File::from_raw_fd(libc::dup(2)) }
         };
         let status = bash_walker::run_streaming(script, &mut state, out, err);
-        if let Some(p) = &path {
+        if let Some(p) = &path_state {
             let _ = bash_walker::state::save_mode(p, &state, mode);
         }
         std::process::exit(status);
@@ -151,6 +151,10 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        // A script run by path is a shell, not a tool call: output goes to
+        // stdout and diagnostics to stderr, as bash does. The `-c` and JSON
+        // modes keep their combined-on-stdout contract, which the replay
+        // harness reads.
         Some(path) if !path.starts_with('-') => {
             let src = match std::fs::read_to_string(path) {
                 Ok(s) => s,
@@ -161,7 +165,23 @@ fn main() {
             };
             state.script_name = path.to_string();
             state.positional = args[1..].to_vec();
-            (src, true)
+            let (out, err) = {
+                use std::os::fd::FromRawFd;
+                // SAFETY: dup yields fresh fds we own.
+                unsafe {
+                    (
+                        std::fs::File::from_raw_fd(libc::dup(1)),
+                        std::fs::File::from_raw_fd(libc::dup(2)),
+                    )
+                }
+            };
+            let status = bash_walker::run_streaming(&src, &mut state, out, err);
+            if let Some(p) = &path_state {
+                if let Err(e) = bash_walker::state::save_mode(p, &state, mode) {
+                    eprintln!("bash-walker: failed to save state: {e}");
+                }
+            }
+            std::process::exit(status);
         }
         _ => {
             let mut input = String::new();
@@ -187,7 +207,7 @@ fn main() {
     };
 
     let (output, returncode) = bash_walker::run(&command, &mut state);
-    if let Some(p) = &path {
+    if let Some(p) = &path_state {
         if let Err(e) = bash_walker::state::save_mode(p, &state, mode) {
             eprintln!("bash-walker: failed to save state: {e}");
         }

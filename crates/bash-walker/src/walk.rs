@@ -1208,18 +1208,63 @@ fn flatten_pipeline(cmd: &Command, out: &mut Vec<Command>) {
     }
 }
 
-/// Bash's `set -x` quoting: a word prints bare when it would survive being
-/// read back, and in single quotes otherwise, with an embedded quote closed
-/// and reopened as `'\''`. An empty word prints as `''`, which is how the
-/// trace shows a field that exists and holds nothing.
+/// Bash's `set -x` quoting, taken from bash 5.3's own output rather than from
+/// memory. Three forms, in order:
+///
+/// - a word holding a control character prints as `$'...'`, with the named
+///   escapes bash uses and three-digit octal for the rest;
+/// - a word needing quotes but holding no control character prints in single
+///   quotes, with an embedded quote closed and reopened as `'\''`;
+/// - anything else prints bare, including printable multibyte text: bash
+///   leaves `café ✓ →` alone.
+///
+/// An empty word prints as `''`, which is how the trace shows a field that
+/// exists and holds nothing.
 fn xtrace_quote(word: &str) -> String {
     if word.is_empty() {
         return "''".to_string();
     }
-    if word.chars().all(|c| c.is_ascii_alphanumeric() || "_./-+=:@%,^".contains(c)) {
+    if word.chars().any(char::is_control) {
+        return ansi_c_quote(word);
+    }
+    if word.chars().all(xtrace_bare) {
         return word.to_string();
     }
     format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// Bash prints these unquoted. The ASCII punctuation set is exactly what bash
+/// 5.3 leaves bare, established by sweeping every punctuation character
+/// through its own trace; `^` is not in it and `#` and `~` are.
+fn xtrace_bare(c: char) -> bool {
+    if c.is_ascii() {
+        c.is_ascii_alphanumeric() || "#%+,-./:=@_~".contains(c)
+    } else {
+        !c.is_control()
+    }
+}
+
+fn ansi_c_quote(word: &str) -> String {
+    let mut out = String::from("$'");
+    for c in word.chars() {
+        match c {
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{b}' => out.push_str("\\v"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            // Bash writes ESC as \E, not \e.
+            '\u{1b}' => out.push_str("\\E"),
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\{:03o}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Parse and execute a source string in the current shell (top level, the

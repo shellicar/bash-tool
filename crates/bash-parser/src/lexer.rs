@@ -162,12 +162,26 @@ impl<'a> Lexer<'a> {
     }
 
     fn scan_quoted(&mut self, quote: u8) -> Result<String, LexError> {
+        self.scan_quoted_span(quote, false)
+    }
+
+    /// `ansi_c` marks the `$'...'` form, where a backslash escapes the next
+    /// character. That matters for `\'`, which does NOT close the span: bash
+    /// runs `echo $'quote\''` and prints `quote'`. Plain `'...'` has no
+    /// escapes at all, which is why the two cannot share one rule.
+    fn scan_quoted_span(&mut self, quote: u8, ansi_c: bool) -> Result<String, LexError> {
         let start = self.pos;
         let mut out = Vec::new();
         out.push(self.bump().unwrap());
         loop {
             match self.peek() {
                 None => return Err(LexError::UnterminatedQuote(start)),
+                Some(b'\\') if ansi_c => {
+                    out.push(self.bump().unwrap());
+                    if let Some(c) = self.bump() {
+                        out.push(c);
+                    }
+                }
                 Some(b'\\') if quote == b'"' => {
                     out.push(self.bump().unwrap());
                     if let Some(c) = self.bump() {
@@ -223,6 +237,14 @@ impl<'a> Lexer<'a> {
                 Some(b'"') => {
                     quoted = true;
                     text.extend_from_slice(self.scan_quoted(b'"')?.as_bytes());
+                }
+                // `$'...'`: ANSI-C quoting, where backslash escapes and `\'`
+                // is a literal quote rather than the terminator.
+                Some(b'$') if self.peek_at(1) == Some(b'\'') => {
+                    quoted = true;
+                    self.pos += 1;
+                    text.push(b'$');
+                    text.extend_from_slice(self.scan_quoted_span(b'\'', true)?.as_bytes());
                 }
                 Some(b'`') => {
                     text.extend_from_slice(

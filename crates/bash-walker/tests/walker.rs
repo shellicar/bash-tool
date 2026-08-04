@@ -1091,3 +1091,60 @@ fn xtrace_shows_a_failed_glob_staying_literal() {
 
     assert_eq!(actual, expected);
 }
+
+/// ANSI-C quoting, `$'...'`. Expectations are bash 5.3's own output, taken
+/// from ~/repos/gnu/bash/bash rather than this machine's /bin/bash, which is
+/// 3.2.57 from 2007 and quotes differently.
+#[test]
+fn an_escaped_quote_inside_ansi_c_quoting_does_not_close_it() {
+    let expected = "quote'\n";
+
+    let (actual, _) = run("echo $'quote\\''");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn an_octal_escape_takes_up_to_three_digits() {
+    let expected = "soh\u{1}end\n";
+
+    let (actual, _) = run("echo $'soh\\001end'");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_uses_ansi_c_quoting_for_a_control_character() {
+    let expected = "+ echo $'tab\\there'";
+
+    let actual = trace("set -x\necho \"tab\there\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_keeps_a_word_holding_a_newline_on_one_line() {
+    let expected = "+ echo $'new\\nline'";
+
+    let actual = trace("set -x\necho \"new\nline\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_leaves_printable_multibyte_text_unquoted() {
+    let expected = "+ echo café ✓";
+
+    let actual = trace("set -x\necho café ✓");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn xtrace_quotes_a_caret_which_bash_does_not_leave_bare() {
+    let expected = "+ echo 'x^x'";
+
+    let actual = trace("set -x\necho 'x^x'");
+
+    assert_eq!(actual, expected);
+}
