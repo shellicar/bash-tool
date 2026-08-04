@@ -1148,3 +1148,23 @@ fn xtrace_quotes_a_caret_which_bash_does_not_leave_bare() {
 
     assert_eq!(actual, expected);
 }
+
+/// A command substitution does not inherit `-e`, but a `set -e` written inside
+/// one applies to its own commands. Both halves verified against bash 5.3.
+#[test]
+fn a_command_substitution_does_not_inherit_errexit() {
+    let expected = "[ok]\n";
+
+    let (actual, _) = run("set -e\necho \"[$(false; echo ok)]\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn errexit_set_inside_a_command_substitution_aborts_it() {
+    let expected = "status=1 x=[]\n";
+
+    let (actual, _) = run("x=$( set -e; false; echo bad )\necho \"status=$? x=[$x]\"");
+
+    assert_eq!(actual, expected);
+}

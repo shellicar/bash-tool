@@ -1295,6 +1295,12 @@ fn run_capture_inner(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow
     let handle = capture.try_clone().map_err(|e| Flow::Fatal(e.to_string()))?;
     let saved_pctx = ex.shared.persistent_ctx.clone();
     let mut sub_state = ex.state.clone();
+    // A substitution does not inherit `-e` (bash: `set -e; echo $(false; echo
+    // ok)` prints ok), but a `set -e` written inside it does apply to its own
+    // commands. Marking the whole body as a tested context did both at once,
+    // so `x=$(set -e; false; echo bad)` ran on and captured "bad" where bash
+    // aborts with an empty capture and status 1.
+    sub_state.flags.errexit = false;
     let status = {
         let mut sub = Exec { state: &mut sub_state, shared: &mut *ex.shared };
         let sub_ctx = Ctx {
@@ -1304,7 +1310,7 @@ fn run_capture_inner(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow
             fds: ctx.fds.clone(),
             derived: true,
         };
-        match run_source(&mut sub, &sub_ctx, src, true) {
+        match run_source(&mut sub, &sub_ctx, src, false) {
             Ok(st) => st,
             Err(Flow::Exit(st)) => st,
             Err(f) => return Err(f),
