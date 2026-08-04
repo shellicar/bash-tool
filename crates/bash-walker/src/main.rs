@@ -21,6 +21,15 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+/// io::Error's Display carries a " (os error N)" suffix bash never prints.
+fn errmsg(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error ") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut path: Option<PathBuf> = std::env::var("BASH_WALKER_STATE").ok().map(PathBuf::from);
@@ -122,14 +131,38 @@ fn main() {
         std::process::exit(status);
     }
 
+    // Invocation forms, matching bash: `-c script [name [args...]]`, a script
+    // path with its own arguments, or the JSON-on-stdin form the harness uses.
+    // The script-path form exists because that is how a shell is invoked, and
+    // bash's own test suite drives `$THIS_SH ./name.tests` that way.
     let (command, direct) = match args.first().map(String::as_str) {
         Some("-c") => match args.get(1) {
-            Some(c) => (c.clone(), true),
+            Some(c) => {
+                // `bash -c script name arg...` sets $0 to name and $1 onward
+                // to the rest, so a script can report its own name.
+                if let Some(name) = args.get(2) {
+                    state.script_name = name.clone();
+                    state.positional = args[3..].to_vec();
+                }
+                (c.clone(), true)
+            }
             None => {
                 eprintln!("bash-walker: -c requires a script argument");
                 std::process::exit(2);
             }
         },
+        Some(path) if !path.starts_with('-') => {
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("bash-walker: {path}: {}", errmsg(&e));
+                    std::process::exit(127);
+                }
+            };
+            state.script_name = path.to_string();
+            state.positional = args[1..].to_vec();
+            (src, true)
+        }
         _ => {
             let mut input = String::new();
             if std::io::stdin().read_to_string(&mut input).is_err() {

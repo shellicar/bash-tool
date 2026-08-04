@@ -51,6 +51,9 @@ pub struct ShellState {
     pub locals: Vec<HashMap<String, Var>>,
     pub funcs: HashMap<String, Command>,
     pub positional: Vec<String>,
+    /// `$0`: the script's path when invoked with one, the name given after a
+    /// `-c` script, and otherwise the shell's own name.
+    pub script_name: String,
     pub flags: Flags,
     pub last_status: i32,
     pub last_background_pid: Option<u32>,
@@ -97,6 +100,7 @@ impl Default for ShellState {
             locals: Vec::new(),
             funcs: HashMap::new(),
             positional: Vec::new(),
+            script_name: "bash".to_string(),
             flags: Flags::default(),
             last_status: 0,
             last_background_pid: None,

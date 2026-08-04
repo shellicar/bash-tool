@@ -903,7 +903,11 @@ fn param_value(ex: &mut Exec, name: &str) -> Result<Expanded, Flow> {
         "#" => Some(ex.state.positional.len().to_string()),
         "@" | "*" => return Ok(Expanded::Many(ex.state.positional.clone())),
         "-" => Some(String::new()),
-        "0" => Some("bash".to_string()),
+        "0" => Some(ex.state.script_name.clone()),
+        // The pid of the shell itself. Bash re-evaluates it per subshell; this
+        // is the process, which is right everywhere the walker forks and wrong
+        // where it uses a thread.
+        "BASHPID" => Some(std::process::id().to_string()),
         d if d.chars().all(|c| c.is_ascii_digit()) => {
             let n: usize = d.parse().unwrap();
             if n == 0 {
@@ -1154,7 +1158,7 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
 }
 
 fn is_special(name: &str) -> bool {
-    matches!(name, "?" | "$" | "!" | "#" | "@" | "*" | "-" | "0" | "RANDOM" | "PIPESTATUS")
+    matches!(name, "?" | "$" | "!" | "#" | "@" | "*" | "-" | "0" | "RANDOM" | "BASHPID" | "PIPESTATUS")
         || name.chars().all(|c| c.is_ascii_digit())
 }
 
