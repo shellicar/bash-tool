@@ -43,6 +43,22 @@ fn main() {
         None => bash_walker::ShellState::default(),
     };
 
+    // Structural question, no execution: how many adjacent trace lines may a
+    // comparator accept out of order for this script. It lives here because
+    // the machine running a replay has this binary and no Rust toolchain.
+    if args.first().is_some_and(|a| a == "--pipeline-width") {
+        let mut src = String::new();
+        if std::io::stdin().read_to_string(&mut src).is_err() {
+            eprintln!("bash-walker: failed to read script from stdin");
+            std::process::exit(2);
+        }
+        let width = bash_parser::parse(&src)
+            .map(|ast| bash_parser::widest_pipeline(&ast))
+            .unwrap_or(1);
+        println!("{width}");
+        return;
+    }
+
     // Background-job child mode: the parent hands the exact AST subtree and
     // shell state on stdin; output streams to the inherited fds. This
     // process IS the background job — a real pid, orphan-safe, like bash's

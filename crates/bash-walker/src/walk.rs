@@ -812,9 +812,8 @@ impl<'a> Exec<'a> {
         if !self.state.flags.xtrace {
             return;
         }
-        let marks = "+".repeat(1 + self.shared.subst_depth as usize);
         let line: Vec<String> = words.iter().map(|w| xtrace_quote(w)).collect();
-        ctx.write_err(&format!("{marks} {}\n", line.join(" ")));
+        ctx.write_err(&format!("{}{}\n", self.xtrace_prefix(), line.join(" ")));
     }
 
     /// An assignment traces as `name=value` with only the value quoted.
@@ -822,8 +821,18 @@ impl<'a> Exec<'a> {
         if !self.state.flags.xtrace {
             return;
         }
-        let marks = "+".repeat(1 + self.shared.subst_depth as usize);
-        ctx.write_err(&format!("{marks} {name}={}\n", xtrace_quote(value)));
+        ctx.write_err(&format!("{}{name}={}\n", self.xtrace_prefix(), xtrace_quote(value)));
+    }
+
+    /// `PS4`, with its first character repeated once per substitution level.
+    /// That is bash's own rule, which is why the default `+ ` becomes `++ `
+    /// inside a substitution rather than `+ + `. Setting PS4 to something
+    /// unmistakable is how a reader tells the trace apart from output that
+    /// happens to start with a plus, which any diff does.
+    fn xtrace_prefix(&self) -> String {
+        let ps4 = self.state.get_var("PS4").unwrap_or_else(|| "+ ".to_string());
+        let lead = ps4.chars().next().unwrap_or('+');
+        format!("{}{ps4}", String::from(lead).repeat(self.shared.subst_depth as usize))
     }
 
     /// Spawn one external command and wait — the `exec cmd` path, where the

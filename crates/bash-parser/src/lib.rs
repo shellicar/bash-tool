@@ -14,7 +14,9 @@ pub mod ast;
 pub mod lexer;
 pub mod parser;
 pub mod pp;
+pub mod shape;
 
 pub use ast::*;
 pub use parser::{parse, ParseError};
 pub use pp::pretty;
+pub use shape::widest_pipeline;
