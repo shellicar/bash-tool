@@ -1075,8 +1075,8 @@ fn xtrace_repeats_the_loop_header_on_every_iteration() {
 }
 
 #[test]
-fn xtrace_reports_the_case_header_with_its_subject_expanded() {
-    let expected = "+ subject=abc\n+ case abc in\n+ echo matched";
+fn xtrace_reports_the_case_header_with_its_subject_unexpanded() {
+    let expected = "+ subject=abc\n+ case $subject in\n+ echo matched";
 
     let actual = trace("set -x\nsubject=abc\ncase $subject in\n  a*) echo matched ;;\nesac");
 
@@ -1165,6 +1165,73 @@ fn errexit_set_inside_a_command_substitution_aborts_it() {
     let expected = "status=1 x=[]\n";
 
     let (actual, _) = run("x=$( set -e; false; echo bad )\necho \"status=$? x=[$x]\"");
+
+    assert_eq!(actual, expected);
+}
+
+/// Defects the adversarial review found, each pinned against what bash 5.3
+/// prints for the same script. All of these produced a plausible wrong answer
+/// with exit status 0, which is the class the walker exists to eliminate.
+
+#[test]
+fn a_backgrounded_compound_sees_the_positional_parameters() {
+    let expected = "[a]\n";
+
+    let (actual, _) = run("set -- a b\n( echo \"[$1]\" ) &\nwait");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn waiting_for_a_failed_job_succeeds() {
+    let expected = "wait=0\n";
+
+    let (actual, _) = run("/usr/bin/false &\nwait\necho \"wait=$?\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn exporting_a_local_does_not_reach_the_callers_variable() {
+    let expected = "[outer]\n";
+
+    let (actual, _) = run("f() { local x=inner; export x; }\nx=outer\nf\necho \"[$x]\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn read_keeps_an_empty_field_between_two_non_whitespace_delimiters() {
+    let expected = "[x][][z]\n";
+
+    let (actual, _) = run("printf 'x::z\\n' | { IFS=: read a b c; echo \"[$a][$b][$c]\"; }");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn read_gives_the_last_variable_the_remainder_with_its_delimiters() {
+    let expected = "[1][2:3]\n";
+
+    let (actual, _) = run("printf '1:2:3\\n' | { IFS=: read a b; echo \"[$a][$b]\"; }");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn read_reports_failure_on_a_final_line_with_no_newline() {
+    let expected = "[a]\n";
+
+    let (actual, _) = run("printf 'a\\nb' | while read v; do echo \"[$v]\"; done");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn read_assigns_the_unterminated_line_before_reporting_failure() {
+    let expected = "1 [a]\n";
+
+    let (actual, _) = run("printf 'a' | { read x; echo \"$? [$x]\"; }");
 
     assert_eq!(actual, expected);
 }

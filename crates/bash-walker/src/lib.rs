@@ -99,6 +99,14 @@ pub struct BackgroundJob {
     pub vars: std::collections::HashMap<String, state::Var>,
     pub cwd: std::path::PathBuf,
     pub umask: u32,
+    /// A fork inherits everything, so the payload has to carry everything a
+    /// fork would. Without these, `set -- a b; ( echo "$1" ) &` saw no
+    /// arguments and `set -x` stopped tracing at the job boundary, both
+    /// silently and both producing different work rather than an error.
+    pub positional: Vec<String>,
+    pub script_name: String,
+    pub flags: state::Flags,
+    pub locals: Vec<std::collections::HashMap<String, state::Var>>,
 }
 
 /// Execute a background job payload, streaming to the given handles.
@@ -110,6 +118,10 @@ pub fn run_background_job(job: BackgroundJob, stdout: std::fs::File, stderr: std
     state.cwd = job.cwd;
     state.umask = job.umask;
     state.funcs = job.funcs;
+    state.positional = job.positional;
+    state.script_name = job.script_name;
+    state.flags = job.flags;
+    state.locals = job.locals;
     let mut shared = Shared::default();
     let mut ex = Exec { state: &mut state, shared: &mut shared };
     let ctx = Ctx {

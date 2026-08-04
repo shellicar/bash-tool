@@ -557,8 +557,14 @@ impl<'a> Exec<'a> {
 
     fn exec_case(&mut self, c: &bash_parser::CaseCommand, ctx: &Ctx) -> Result<i32, Flow> {
         let subject = expand::expand_single(self, ctx, &c.word)?;
-        // Bash traces the header once, with the subject already expanded.
-        self.xtrace(ctx, &["case".to_string(), subject.clone(), "in".to_string()]);
+        // Bash traces the header with the subject UNEXPANDED, as written:
+        // `case $subject in`, not `case abc in`. It is the one trace line that
+        // shows source rather than the result of expansion, so the word goes
+        // out as its own text and never through the quoter.
+        if self.state.flags.xtrace {
+            let prefix = self.xtrace_prefix();
+            ctx.write_err(&format!("{prefix}case {} in\n", c.word.text));
+        }
         let mut status = 0;
         let mut fell_through = false;
         for arm in &c.arms {
@@ -673,6 +679,10 @@ impl<'a> Exec<'a> {
             vars: self.state.vars.clone(),
             cwd: self.state.cwd.clone(),
             umask: self.state.umask,
+            positional: self.state.positional.clone(),
+            script_name: self.state.script_name.clone(),
+            flags: self.state.flags,
+            locals: self.state.locals.clone(),
         };
         let payload = serde_json::to_string(&job)
             .map_err(|e| Flow::Fatal(format!("background job: {e}")))?;
@@ -1227,7 +1237,15 @@ fn xtrace_quote(word: &str) -> String {
     if word.chars().any(char::is_control) {
         return ansi_c_quote(word);
     }
-    if word.chars().all(xtrace_bare) {
+    // A lone quote is the one word bash backslash-escapes rather than wrapping,
+    // because wrapping it produces the four-token `''\'''`.
+    if word == "'" {
+        return "\\'".to_string();
+    }
+    // `#` and `~` are metacharacters only at the start of a word, which is why
+    // `a#b` prints bare and `#` does not.
+    let starts_meta = matches!(word.chars().next(), Some('#') | Some('~'));
+    if !starts_meta && word.chars().all(xtrace_bare) {
         return word.to_string();
     }
     format!("'{}'", word.replace('\'', "'\\''"))
@@ -1235,7 +1253,8 @@ fn xtrace_quote(word: &str) -> String {
 
 /// Bash prints these unquoted. The ASCII punctuation set is exactly what bash
 /// 5.3 leaves bare, established by sweeping every punctuation character
-/// through its own trace; `^` is not in it and `#` and `~` are.
+/// through its own trace; `^` is not in it, and `#` and `~` are bare only away
+/// from the start of a word, which `xtrace_quote` handles.
 fn xtrace_bare(c: char) -> bool {
     if c.is_ascii() {
         c.is_ascii_alphanumeric() || "#%+,-./:=@_~".contains(c)

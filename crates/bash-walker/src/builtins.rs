@@ -103,14 +103,14 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
         "set" => set(ex, ctx, args),
         "read" => read(ex, ctx, args),
         "wait" => {
-            let mut status = 0;
+            // Waiting for every job succeeds; it is `wait PID` that reports the
+            // job's own status. Returning the last child's status made
+            // `cmd & wait` fail whenever the job did, so `set -e` scripts and
+            // `if ... wait` branches took the other path.
             for mut child in ex.shared.bg.drain(..) {
-                status = child
-                    .wait()
-                    .map(|s| s.code().unwrap_or(1))
-                    .unwrap_or(1);
+                let _ = child.wait();
             }
-            Ok(status)
+            Ok(0)
         }
         "eval" => {
             let src = args.join(" ");
@@ -860,6 +860,7 @@ fn read(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
     };
     let mut line = Vec::new();
     let mut got_any = false;
+    let mut saw_newline = false;
     let mut buf = [0u8; 1];
     let mut f = &**stdin;
     loop {
@@ -868,6 +869,7 @@ fn read(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
             Ok(_) => {
                 got_any = true;
                 if buf[0] == b'\n' {
+                    saw_newline = true;
                     break;
                 }
                 line.push(buf[0]);
@@ -878,6 +880,10 @@ fn read(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
     if !got_any {
         return Ok(1);
     }
+    // A final line with no newline is assigned and then reported as failure,
+    // which is what ends a `while read` loop. Returning 0 ran one iteration
+    // bash never runs.
+    let unterminated = !saw_newline;
     let line = String::from_utf8_lossy(&line).into_owned();
 
     let ifs = ex.state.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
@@ -891,24 +897,56 @@ fn read(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
         for v in &vars[1..] {
             ex.state.set_var(v, String::new());
         }
-        return Ok(0);
+        return Ok(i32::from(unterminated));
     }
+    // Only runs of IFS WHITESPACE collapse. A non-whitespace delimiter
+    // delimits each time it appears, so `x::z` under `IFS=:` is three fields
+    // with an empty middle, not two. Dropping empties shifted every variable
+    // after the gap.
     let seps: Vec<char> = ifs.chars().collect();
-    let mut fields: Vec<&str> = line
-        .split(|c: char| seps.contains(&c))
-        .filter(|s| !s.is_empty())
-        .collect();
+    let ws: Vec<char> = seps.iter().copied().filter(|c| c.is_whitespace()).collect();
+    let trimmed = line.trim_matches(|c: char| ws.contains(&c));
+    let mut fields: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let bytes: Vec<(usize, char)> = trimmed.char_indices().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (idx, c) = bytes[i];
+        if !seps.contains(&c) {
+            i += 1;
+            continue;
+        }
+        fields.push(&trimmed[start..idx]);
+        // A non-whitespace delimiter may be followed by whitespace, and that
+        // run belongs to the same separator rather than making a field.
+        i += 1;
+        while i < bytes.len() && ws.contains(&bytes[i].1) {
+            i += 1;
+        }
+        // Consecutive whitespace separators collapse into one.
+        if c.is_whitespace() {
+            while i < bytes.len() && seps.contains(&bytes[i].1) && bytes[i].1.is_whitespace() {
+                i += 1;
+            }
+        }
+        start = bytes.get(i).map(|(b, _)| *b).unwrap_or(trimmed.len());
+    }
+    fields.push(&trimmed[start..]);
+
+    // The last variable takes the whole remainder, delimiters and all, rather
+    // than the fields rejoined with a space.
     let last_join;
     if fields.len() > vars.len() {
-        let head = fields[..vars.len() - 1].to_vec();
-        last_join = fields[vars.len() - 1..].join(" ");
-        fields = head;
+        let keep = vars.len() - 1;
+        let rest_starts = trimmed.len() - fields[keep..].join("").len() - (fields.len() - keep - 1);
+        last_join = trimmed[rest_starts..].to_string();
+        fields.truncate(keep);
         fields.push(&last_join);
     }
     for (i, v) in vars.iter().enumerate() {
         ex.state.set_var(v, fields.get(i).copied().unwrap_or("").to_string());
     }
-    Ok(0)
+    Ok(i32::from(unterminated))
 }
 
 fn command(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {

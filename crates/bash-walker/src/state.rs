@@ -32,7 +32,7 @@ pub struct PersistedState {
     pub umask: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Flags {
     /// `set -e`: stop on an untested failure.
     pub errexit: bool,
@@ -141,6 +141,16 @@ impl ShellState {
         let value = value
             .or_else(|| self.get_var(name))
             .unwrap_or_default();
+        // Marking a local exported must not reach the global of the same name.
+        // Writing straight to `vars` meant a function exporting its own local
+        // overwrote the caller's variable, and the overwrite outlived the call.
+        for scope in self.locals.iter_mut().rev() {
+            if let Some(v) = scope.get_mut(name) {
+                v.value = value;
+                v.exported = true;
+                return;
+            }
+        }
         self.vars.insert(name.to_string(), Var { value, exported: true });
     }
 
