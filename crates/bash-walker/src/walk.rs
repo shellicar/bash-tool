@@ -731,8 +731,9 @@ impl<'a> Exec<'a> {
             }
             Some(_) => {
                 let mut assigns = Vec::new();
-                for (k, v) in &s.assignments {
-                    assigns.push((k.clone(), expand::expand_single(self, ctx, v)?));
+                for a in &s.assignments {
+                    let v = expand::expand_single(self, ctx, &a.value)?;
+                    assigns.push((a.name.clone(), self.joined_value(a, v)));
                 }
                 Ok(Prepared::External {
                     fields,
@@ -754,8 +755,9 @@ impl<'a> Exec<'a> {
             .is_some_and(|p| DECL_BUILTINS.contains(&p.text.as_str()));
 
         let mut assigns = Vec::new();
-        for (k, v) in &s.assignments {
-            assigns.push((k.clone(), expand::expand_single(self, ctx, v)?));
+        for a in &s.assignments {
+            let v = expand::expand_single(self, ctx, &a.value)?;
+            assigns.push((a.name.clone(), self.joined_value(a, v)));
         }
 
         let fields = match &s.program {
@@ -852,6 +854,17 @@ impl<'a> Exec<'a> {
             SpawnResult::Child(mut ch) => Ok(wait_reporting(&mut ch, ctx)),
             SpawnResult::Failed(st) => Ok(st),
         }
+    }
+
+    /// `NAME+=value` appends to what the variable already holds; a plain
+    /// assignment replaces it.
+    fn joined_value(&self, a: &bash_parser::ast::Assign, v: String) -> String {
+        if !a.append {
+            return v;
+        }
+        let mut joined = self.state.get_var(&a.name).unwrap_or_default();
+        joined.push_str(&v);
+        joined
     }
 
     /// `FOO=1 builtin/function`: the assignments live for the call only.

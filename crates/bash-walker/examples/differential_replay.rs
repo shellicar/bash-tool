@@ -360,8 +360,8 @@ const NONDET_VARS: &[&str] = &[
 fn collect_assigned(cmd: &Command, out: &mut HashSet<String>) {
     match cmd {
         Command::Simple(s) => {
-            for (k, _) in &s.assignments {
-                out.insert(k.clone());
+            for a in &s.assignments {
+                out.insert(a.name.clone());
             }
         }
         Command::Connection(c) => {
@@ -524,8 +524,8 @@ fn redirect_is_pure(r: &Redirect, assigned: &HashSet<String>, mode: Mode) -> boo
 }
 
 fn simple_is_pure(s: &SimpleCommand, assigned: &HashSet<String>, mode: Mode) -> bool {
-    for (_, v) in &s.assignments {
-        if !word_is_pure(v, assigned, mode, false) {
+    for a in &s.assignments {
+        if !word_is_pure(&a.value, assigned, mode, false) {
             return false;
         }
     }

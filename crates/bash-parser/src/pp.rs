@@ -56,10 +56,11 @@ fn write_redirect(out: &mut String, r: &Redirect, depth: usize) {
 fn write_simple(out: &mut String, s: &SimpleCommand, depth: usize) {
     indent(out, depth);
     out.push_str("simple\n");
-    for (k, v) in &s.assignments {
+    for a in &s.assignments {
         indent(out, depth + 1);
-        let _ = write!(out, "assign {k}=");
-        write_word(out, v);
+        let op = if a.append { "+=" } else { "=" };
+        let _ = write!(out, "assign {}{op}", a.name);
+        write_word(out, &a.value);
         out.push('\n');
     }
     if let Some(p) = &s.program {

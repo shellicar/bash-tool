@@ -777,6 +777,18 @@ fn matched_paren(b: &[u8], open: usize) -> Option<usize> {
     while i < b.len() {
         match b[i] {
             b'\\' => i += 1,
+            // `$'...'` escapes its own quote, so `\'` inside it is a literal
+            // and must not close the span. Without this `$(printf $'don\'t')`
+            // finds no closing paren at all.
+            b'$' if i + 1 < b.len() && b[i + 1] == b'\'' => {
+                i += 2;
+                while i < b.len() && b[i] != b'\'' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
             b'\'' => {
                 i += 1;
                 while i < b.len() && b[i] != b'\'' {

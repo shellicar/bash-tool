@@ -4,6 +4,15 @@
 //! docs/ast-execution.md, "AST node shape"). Redirects thread through every
 //! variant, attached after the fact, same as bash's own grammar actions.
 
+/// A `NAME=value` or `NAME+=value` prefix. Bash appends to the existing value
+/// for the `+=` form and replaces it for the plain one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Assign {
+    pub name: String,
+    pub value: Word,
+    pub append: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Word {
     /// The literal text as bash's parser saw it. `$(...)`/`` ` ` ``/`${...}`/
@@ -60,7 +69,7 @@ pub struct SimpleCommand {
     /// setting variables in the calling shell (`cd`-like statefulness, see
     /// docs/ast-execution.md's `cd`/assignment finding). `program` is `None`
     /// in that case.
-    pub assignments: Vec<(String, Word)>,
+    pub assignments: Vec<Assign>,
     pub program: Option<Word>,
     pub args: Vec<Word>,
     pub redirects: Vec<Redirect>,

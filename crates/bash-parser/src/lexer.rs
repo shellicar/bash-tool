@@ -88,6 +88,31 @@ impl<'a> Lexer<'a> {
         std::mem::take(&mut self.bodies)
     }
 
+}
+
+/// `((` opens arithmetic only if what sits between the outer parens could be
+/// an expression. `((echo a) && (echo b))` also ends in `))`, but its interior
+/// closes a paren before it opens one, which no expression does. Bash resolves
+/// the same ambiguity by parsing the interior and rewinding when that fails.
+fn is_arith_interior(text: &str) -> bool {
+    let inner = &text[2..text.len() - 2];
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+impl<'a> Lexer<'a> {
     fn peek(&self) -> Option<u8> {
         self.src.get(self.pos).copied()
     }
@@ -145,6 +170,14 @@ impl<'a> Lexer<'a> {
                 Some(c @ (b'\'' | b'"')) if c != close => {
                     let quoted = self.scan_quoted(c)?;
                     out.extend_from_slice(quoted.as_bytes());
+                }
+                // `$'...'` obeys its own escaping, so a `\'` inside it is a
+                // literal quote and does not end the span. Without this the
+                // scan closes early and the bracket never matches.
+                Some(b'$') if matches!(self.peek_at(1), Some(b'\'')) => {
+                    out.push(self.bump().unwrap());
+                    let ansi = self.scan_quoted_span(b'\'', true)?;
+                    out.extend_from_slice(ansi.as_bytes());
                 }
                 Some(c) if open != close && c == open => {
                     depth += 1;
@@ -344,6 +377,13 @@ impl<'a> Lexer<'a> {
                     Some(b'`') => chunk.extend_from_slice(
                         self.scan_matched(b'`', b'`', "backtick substitution")?.as_bytes(),
                     ),
+                    // `$'...'` before the bare-quote arms, so its own escaping
+                    // applies and `\'` does not close the chunk early.
+                    Some(b'$') if self.peek_at(1) == Some(b'\'') => {
+                        self.pos += 1;
+                        chunk.push(b'$');
+                        chunk.extend_from_slice(self.scan_quoted_span(b'\'', true)?.as_bytes());
+                    }
                     Some(b'$') if self.peek_at(1) == Some(b'(') => {
                         self.pos += 1;
                         chunk.push(b'$');
@@ -481,7 +521,9 @@ impl<'a> Lexer<'a> {
                 // emit a plain `(`. Mirrors bash's own lookahead-to-`))`.
                 let start = self.pos;
                 match self.scan_matched(b'(', b')', "arithmetic command ((...))") {
-                    Ok(text) if text.ends_with("))") => Ok(Token::Arith(text)),
+                    Ok(text) if text.ends_with("))") && is_arith_interior(&text) => {
+                        Ok(Token::Arith(text))
+                    }
                     _ => {
                         self.pos = start + 1;
                         Ok(Token::LParen)
@@ -541,9 +583,15 @@ impl<'a> Lexer<'a> {
                 while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
                     self.pos += 1;
                 }
-                if matches!(self.peek(), Some(b'<') | Some(b'>')) {
-                    let digits = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
-                    Ok(Token::Fd(digits.parse().unwrap()))
+                // Bash lexes a digit run as an fd only while it fits a signed
+                // 32-bit int; above INT_MAX the digits are an ordinary word.
+                // Verified against 5.3: `echo a 2147483647>f` redirects, while
+                // `echo a 2147483648>f` writes the digits as an argument.
+                let fd = std::str::from_utf8(&self.src[start..self.pos])
+                    .unwrap()
+                    .parse::<i32>();
+                if let (true, Ok(fd)) = (matches!(self.peek(), Some(b'<') | Some(b'>')), fd) {
+                    Ok(Token::Fd(fd as u32))
                 } else {
                     self.pos = start; // not an fd prefix — rewind, tokenize as an ordinary word
                     let (text, quoted) = self.scan_word()?;

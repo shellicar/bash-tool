@@ -1235,3 +1235,48 @@ fn read_assigns_the_unterminated_line_before_reporting_failure() {
 
     assert_eq!(actual, expected);
 }
+
+/// `NAME+=value` appends. Before this the whole word failed the name test and
+/// became the program name, so bash's `PATH+=:/opt/bin make` ran `make` while
+/// the walker tried to run `PATH+=:/opt/bin`.
+#[test]
+fn an_append_assignment_appends_to_the_existing_value() {
+    let expected = "v=[basex]\n";
+
+    let (actual, _) = run("v=base\nv+=x\necho \"v=[$v]\"");
+
+    assert_eq!(actual, expected);
+}
+
+/// bash 5.3 runs this as nested subshells; the `))` lookahead used to claim it
+/// as arithmetic because the span happens to end in two closers.
+#[test]
+fn a_double_paren_span_of_two_subshells_runs_both() {
+    let expected = "a\nb\n";
+
+    let (actual, _) = run("((echo a) && (echo b))");
+
+    assert_eq!(actual, expected);
+}
+
+/// Above INT_MAX bash stops treating a digit run as an fd and passes it as an
+/// argument. The walker used to consume it, truncate the target and report 0.
+#[test]
+fn a_digit_run_above_int_max_is_an_argument_not_an_fd() {
+    let expected = "mid 2147483648\n";
+
+    let (actual, _) = run("echo mid 2147483648>/tmp/walker-fd-band; cat /tmp/walker-fd-band");
+
+    assert_eq!(actual, expected);
+}
+
+/// `$'...'` escapes its own quote, so `\'` is a literal and does not close the
+/// span. Both the lexer and the expander scanned past it and lost the closer.
+#[test]
+fn ansi_c_quoting_survives_inside_a_command_substitution() {
+    let expected = "don't\n";
+
+    let (actual, _) = run(r"echo $(printf $'don\'t')");
+
+    assert_eq!(actual, expected);
+}

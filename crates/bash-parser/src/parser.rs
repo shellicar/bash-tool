@@ -444,9 +444,13 @@ impl<'a> Parser<'a> {
                     let w = w.clone();
                     let quoted = *quoted;
                     if program.is_none() {
-                        if let Some((k, v)) = split_assignment(&w) {
+                        if let Some((name, v, append)) = split_assignment(&w) {
                             self.advance()?;
-                            assignments.push((k, Word { text: v, quoted }));
+                            assignments.push(Assign {
+                                name,
+                                value: Word { text: v, quoted },
+                                append,
+                            });
                             continue;
                         }
                     }
@@ -533,13 +537,20 @@ impl<'a> Parser<'a> {
 
 /// `NAME=value` at the *start* of a word only — bash's `token_is_assignment`
 /// (parse.y) checks the whole prefix is a valid identifier before the `=`.
-fn split_assignment(w: &str) -> Option<(String, String)> {
+/// `NAME=value`, or `NAME+=value` which appends. Without the `+=` form the
+/// whole word fails the name test and becomes the program name, so
+/// `PATH+=:/opt/bin make` would try to run `PATH+=:/opt/bin`.
+fn split_assignment(w: &str) -> Option<(String, String, bool)> {
     let eq = w.find('=')?;
-    let (name, rest) = w.split_at(eq);
+    let (head, rest) = w.split_at(eq);
+    let (name, append) = match head.strip_suffix('+') {
+        Some(n) => (n, true),
+        None => (head, false),
+    };
     if !is_name(name) {
         return None;
     }
-    Some((name.to_string(), rest[1..].to_string()))
+    Some((name.to_string(), rest[1..].to_string(), append))
 }
 
 fn is_name(s: &str) -> bool {
@@ -855,15 +866,15 @@ mod tests {
         let cmd = parse("FOO=bar").unwrap();
         let s = simple(&cmd);
         assert!(s.program.is_none());
-        assert_eq!(s.assignments[0].0, "FOO");
-        assert_eq!(s.assignments[0].1.text, "bar");
+        assert_eq!(s.assignments[0].name, "FOO");
+        assert_eq!(s.assignments[0].value.text, "bar");
     }
 
     #[test]
     fn array_assignment_is_one_word() {
         let cmd = parse("FOO=(a b c)").unwrap();
         let s = simple(&cmd);
-        assert_eq!(s.assignments[0].1.text, "(a b c)");
+        assert_eq!(s.assignments[0].value.text, "(a b c)");
     }
 
     #[test]
@@ -1246,5 +1257,62 @@ mod tests {
     fn select_is_a_named_unsupported_error_not_silent() {
         let err = parse("select x in a b; do echo $x; done").unwrap_err();
         assert!(matches!(err, ParseError::Unsupported("select")));
+    }
+
+    #[test]
+    fn a_double_paren_span_of_two_subshells_is_not_arithmetic() {
+        // bash runs this as nested subshells printing a then b; the
+        // `))`-lookahead claims it because the span happens to end in two
+        // closers.
+        let cmd = parse("((echo a) && (echo b))").unwrap();
+        match cmd {
+            Command::Subshell(_) => {}
+            other => panic!("expected Subshell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_fd_prefix_is_reported_not_panicked_on() {
+        let expected = true;
+
+        let actual =
+            std::panic::catch_unwind(|| parse("echo 99999999999999999999>x")).is_ok();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ansi_c_quoting_survives_inside_a_command_substitution() {
+        let expected = r"$(printf $'don\'t')";
+
+        let cmd = parse(r"echo $(printf $'don\'t')").unwrap();
+        let actual = &simple(&cmd).args[0].text;
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ansi_c_quoting_survives_inside_a_cond_expression() {
+        let cmd = parse(r"[[ $x == $'a\'b' ]]").unwrap();
+        match cmd {
+            Command::Cond(CondExpr::Binary { right, .. }) => {
+                let expected = r"$'a\'b'";
+
+                let actual = right.text;
+
+                assert_eq!(actual, expected);
+            }
+            other => panic!("expected Cond(Binary), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_append_assignment_is_not_taken_as_the_program_name() {
+        let expected = "make";
+
+        let cmd = parse("PATH+=:/opt/bin make").unwrap();
+        let actual = &simple(&cmd).program.as_ref().unwrap().text;
+
+        assert_eq!(actual, expected);
     }
 }
