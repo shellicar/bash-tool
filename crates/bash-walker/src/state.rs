@@ -119,6 +119,12 @@ fn is_attr_key(key: &str) -> bool {
     key.starts_with('\u{1}')
 }
 
+/// How far into the current word `getopts` has read — what makes `-abc`
+/// three options. It is stored beside `OPTIND` in whichever scope declares
+/// that variable, which is what gives a function with its own `local
+/// OPTIND` its own scan, restored when the call returns.
+const GETOPTS_KEY: &str = "\u{1}getopts";
+
 fn write_attrs(map: &mut HashMap<String, Var>, name: &str, key: &str, attrs: Attrs) {
     if let Some(v) = map.get_mut(name) {
         v.exported = attrs.exported;
@@ -447,6 +453,13 @@ impl Default for ShellState {
             "PWD".to_string(),
             Var { value: cwd.to_string_lossy().into_owned(), exported: true },
         );
+        // bash starts with `declare -i OPTIND="1"`, and scripts read it
+        // before ever calling getopts.
+        vars.insert("OPTIND".to_string(), Var { value: "1".to_string(), exported: false });
+        vars.insert(
+            attr_key("OPTIND"),
+            Var { value: Attrs { integer: true, ..Attrs::default() }.letters(), exported: false },
+        );
         Self {
             vars,
             locals: Vec::new(),
@@ -515,6 +528,33 @@ impl ShellState {
     pub fn shopt(&self, name: &str) -> Option<bool> {
         let default = SHOPT_DEFAULTS.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)?;
         Some(default ^ self.shopts.contains(name))
+    }
+
+    /// The scan position for the `OPTIND` currently in scope.
+    pub fn getopts_charpos(&self) -> usize {
+        let map = match self.optind_scope() {
+            Some(i) => &self.locals[i],
+            None => &self.vars,
+        };
+        map.get(GETOPTS_KEY).and_then(|v| v.value.parse().ok()).unwrap_or(0)
+    }
+
+    pub fn set_getopts_charpos(&mut self, charpos: usize) {
+        let map = match self.optind_scope() {
+            Some(i) => &mut self.locals[i],
+            None => &mut self.vars,
+        };
+        map.insert(
+            GETOPTS_KEY.to_string(),
+            Var { value: charpos.to_string(), exported: false },
+        );
+    }
+
+    fn optind_scope(&self) -> Option<usize> {
+        let key = attr_key("OPTIND");
+        (0..self.locals.len())
+            .rev()
+            .find(|&i| self.locals[i].contains_key("OPTIND") || self.locals[i].contains_key(&key))
     }
 
     pub fn set_shopt(&mut self, name: &str, on: bool) {
@@ -625,6 +665,12 @@ impl ShellState {
     /// then a scope that declared the name without a value, then the shell
     /// vars (keeping whatever export flag was already there).
     fn store(&mut self, name: &str, value: String, exported: bool) {
+        // Assigning OPTIND restarts the scan, which is how a script rewinds
+        // getopts and how a function's own `local OPTIND=1` starts a fresh
+        // one. getopts itself writes the position back afterwards.
+        if name == "OPTIND" {
+            self.set_getopts_charpos(0);
+        }
         let key = attr_key(name);
         for scope in self.locals.iter_mut().rev() {
             if let Some(v) = scope.get_mut(name) {

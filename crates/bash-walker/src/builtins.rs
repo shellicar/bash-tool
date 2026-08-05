@@ -14,11 +14,11 @@ const NATIVE: &[&str] = &[
     "cd", "pwd", "export", "unset", "local", "exit", "return", "break", "continue", "shift",
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
     "echo", "printf", "exec", "umask", "builtin", "declare", "typeset", "readonly",
-    "shopt",
+    "shopt", "getopts",
 ];
 
 const UNSUPPORTED: &[&str] = &[
-    "alias", "unalias", "trap", "getopts", "ulimit",
+    "alias", "unalias", "trap", "ulimit",
     "jobs", "fg", "bg", "hash", "type", "help", "history", "disown", "suspend", "times",
     "caller", "enable", "pushd", "popd", "dirs", "mapfile", "readarray",
 ];
@@ -85,6 +85,7 @@ pub fn run(
         }
         "set" => set(ex, ctx, args),
         "shopt" => shopt(ex, ctx, args),
+        "getopts" => getopts(ex, ctx, args),
         "read" => read(ex, ctx, args),
         "wait" => {
             // Waiting for every job succeeds; it is `wait PID` that reports the
@@ -1174,6 +1175,154 @@ fn set(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
         i += 1;
     }
     Ok(0)
+}
+
+/// `getopts optstring name [arg ...]` — one option per call, with the
+/// scan's position carried in `OPTIND` and in the walker's own record of
+/// how far into the current word it has read.
+fn getopts(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    const USAGE: &str = "getopts: usage: getopts optstring name [arg ...]\n";
+    if let Some(a) = args.first() {
+        if a.starts_with('-') && a.len() > 1 {
+            ctx.write_err(&format!("bash-walker: getopts: {a}: invalid option\n{USAGE}"));
+            return Ok(2);
+        }
+    }
+    let (Some(optstring), Some(name)) = (args.first(), args.get(1)) else {
+        ctx.write_err(USAGE);
+        return Ok(2);
+    };
+    let words: Vec<String> = if args.len() > 2 {
+        args[2..].to_vec()
+    } else {
+        ex.state.positional.clone()
+    };
+
+    let silent = optstring.starts_with(':');
+    // OPTERR=0 silences the messages without changing what getopts reports
+    // back through the variable, which is what a leading colon does.
+    let quiet = silent || ex.state.get_var("OPTERR").as_deref() == Some("0");
+    let spec: Vec<char> = optstring.chars().collect();
+
+    let stated: i64 = ex.state.get_var("OPTIND").and_then(|v| v.trim().parse().ok()).unwrap_or(1);
+    let mut charpos = ex.state.getopts_charpos();
+    let mut optind = if stated < 1 { 1usize } else { stated as usize };
+
+    // What to report back, once the scan has moved: the value for the
+    // caller's variable, what OPTARG becomes, and getopts' own status.
+    // Every path ends at the same place, because bash advances the scan
+    // before it discovers it cannot store the answer.
+    let mut optarg: Option<String> = None;
+    let mut status = 0;
+    let mut value = "?".to_string();
+
+    let word = loop {
+        match words.get(optind - 1) {
+            None => {
+                charpos = 0;
+                status = 1;
+                break None;
+            }
+            Some(word) if charpos > 0 => break Some(word.clone()),
+            Some(word) if word == "--" => {
+                optind += 1;
+                charpos = 0;
+                status = 1;
+                break None;
+            }
+            Some(word) if !word.starts_with('-') || word == "-" => {
+                charpos = 0;
+                status = 1;
+                break None;
+            }
+            Some(word) => {
+                charpos = 1;
+                break Some(word.clone());
+            }
+        }
+    };
+
+    if let Some(word) = word {
+        let chars: Vec<char> = word.chars().collect();
+        let c = chars[charpos];
+        charpos += 1;
+        // The word is used up: the next call starts at the next argument.
+        if charpos >= chars.len() {
+            optind += 1;
+            charpos = 0;
+        }
+        let known = c != ':' && spec.contains(&c);
+        let takes_arg = known
+            && spec.iter().position(|&s| s == c).is_some_and(|i| spec.get(i + 1) == Some(&':'));
+        if !known {
+            if !quiet {
+                ctx.write_err(&format!("{}: illegal option -- {c}\n", ex.state.script_name));
+            }
+            if silent {
+                optarg = Some(c.to_string());
+            }
+        } else if !takes_arg {
+            value = c.to_string();
+        } else {
+            // `-b bval` and `-bbval` are the same option with the same
+            // argument.
+            let arg = if charpos > 0 {
+                let rest: String = chars[charpos..].iter().collect();
+                optind += 1;
+                charpos = 0;
+                Some(rest)
+            } else {
+                words.get(optind - 1).cloned().inspect(|_| optind += 1)
+            };
+            match arg {
+                Some(a) => {
+                    value = c.to_string();
+                    optarg = Some(a);
+                }
+                None => {
+                    if !quiet {
+                        ctx.write_err(&format!(
+                            "{}: option requires an argument -- {c}\n",
+                            ex.state.script_name
+                        ));
+                    }
+                    if silent {
+                        value = ":".to_string();
+                        optarg = Some(c.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Writing OPTIND is itself what rewinds the scan, so the position goes
+    // back afterwards, never before.
+    ex.state.set_var("OPTIND", optind.to_string());
+    ex.state.set_getopts_charpos(charpos);
+
+    if !is_identifier(name) {
+        ctx.write_err(&format!("bash-walker: getopts: `{name}': not a valid identifier\n"));
+        return Ok(1);
+    }
+    if ex.state.assign(name, value).is_err() {
+        ctx.write_err(&format!("bash-walker: {name}: readonly variable\n"));
+        return Ok(2);
+    }
+    match optarg {
+        Some(a) => {
+            if ex.state.assign("OPTARG", a).is_err() {
+                ctx.write_err("bash-walker: OPTARG: readonly variable\n");
+                return Ok(2);
+            }
+        }
+        // Clearing OPTARG is silent even when it cannot happen: bash
+        // reports a readonly OPTARG when it has something to store, and
+        // says nothing when it has not.
+        None => {
+            let _ = ex.state.unset_var("OPTARG");
+        }
+    }
+    Ok(status)
 }
 
 /// `set -o` prints a table of every option; `set +o` prints the commands

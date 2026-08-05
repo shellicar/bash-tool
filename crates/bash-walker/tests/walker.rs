@@ -1572,3 +1572,71 @@ fn a_set_option_the_walker_cannot_honour_is_refused_by_name() {
     assert_ne!(status, 0);
     assert!(output.contains("set -o noclobber: not supported"), "{output}");
 }
+
+#[test]
+fn getopts_walks_the_options_then_reports_the_end() {
+    let expected = ("a: OPTIND=2\nb=bval: OPTIND=4\nrest: one\n".to_string(), 0);
+
+    let actual = run(
+        "set -- -a -b bval one\nwhile getopts ab: opt; do\n  case $opt in\n  a) echo \"a: OPTIND=$OPTIND\" ;;\n  b) echo \"b=$OPTARG: OPTIND=$OPTIND\" ;;\n  esac\ndone\nshift $((OPTIND - 1))\necho \"rest: $1\"",
+    );
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn getopts_reads_a_cluster_one_option_at_a_time() {
+    let expected = ("a\nb\nc=val\n".to_string(), 0);
+
+    let actual = run("set -- -ab -cval; while getopts abc: o; do echo \"$o${OPTARG:+=$OPTARG}\"; done");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn getopts_in_silent_mode_reports_the_offending_letter_in_optarg() {
+    let expected = ("?:x\n::b\n".to_string(), 0);
+
+    let actual = run("set -- -x -b; while getopts :ab: o; do echo \"$o:$OPTARG\"; done");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn getopts_complains_about_an_unknown_option_when_not_silent() {
+    let (output, _) = run("set -- -x; getopts ab: o; echo \"o=$o\"");
+
+    assert!(output.contains("illegal option -- x"), "{output}");
+    assert!(output.contains("o=?\n"), "{output}");
+}
+
+#[test]
+fn a_double_dash_ends_the_options_and_is_stepped_over() {
+    let expected = ("a\nend OPTIND=3\n".to_string(), 0);
+
+    let actual = run("set -- -a -- -b; while getopts ab: o; do echo \"$o\"; done; echo \"end OPTIND=$OPTIND\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_function_with_its_own_optind_scans_without_disturbing_the_caller() {
+    let expected = ("opt: x\nopt: y\nopt: a\nopt: b\nopt: c\nopt: z\n".to_string(), 0);
+
+    let actual = run(
+        "f() {\n  typeset OPTIND=1\n  typeset opt\n  while getopts \":abcxyz\" opt; do\n    echo opt: \"$opt\"\n    if [ \"$opt\" = y ]; then f -abc; fi\n  done\n}\nf -xyz",
+    );
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn resetting_optind_restarts_the_scan() {
+    let expected = ("a\nb\na\nb\n".to_string(), 0);
+
+    let actual = run(
+        "set -- -ab\nwhile getopts ab o; do echo $o; done\nOPTIND=1\nwhile getopts ab o; do echo $o; done",
+    );
+
+    assert_eq!(actual, expected);
+}
