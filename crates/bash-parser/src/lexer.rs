@@ -58,8 +58,15 @@ pub enum Token {
 }
 
 pub struct Lexer<'a> {
+    text: &'a str,
     src: &'a [u8],
     pos: usize,
+    /// Where the token `next_token` last returned began, comments and blanks
+    /// already skipped. The command-substitution scanner needs it: it parses
+    /// the interior and then has to know where the `)` that stopped the parse
+    /// actually sits in the source.
+    token_start: usize,
+    in_command_substitution: bool,
     /// Heredocs seen on the current line, awaiting their bodies. Bash defers
     /// body capture until the newline that ends the line the `<<` appeared
     /// on — tokens after the delimiter word (`cat <<EOF | grep x`) belong to
@@ -76,11 +83,31 @@ pub enum LexError {
     UnterminatedQuote(usize),
     #[error("unterminated {0} starting at byte {1}")]
     UnterminatedBracket(&'static str, usize),
+    #[error("syntax error inside the command substitution at byte {0}: {1}")]
+    CommandSubstitution(usize, String),
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
-        Self { src: src.as_bytes(), pos: 0, pending_heredocs: Vec::new(), bodies: VecDeque::new() }
+        Self {
+            text: src,
+            src: src.as_bytes(),
+            pos: 0,
+            token_start: 0,
+            in_command_substitution: false,
+            pending_heredocs: Vec::new(),
+            bodies: VecDeque::new(),
+        }
+    }
+
+    pub fn token_start(&self) -> usize {
+        self.token_start
+    }
+
+    /// Mark this lexer as reading the interior of a `$(...)`. It changes one
+    /// thing: how a heredoc body ends. See `capture_heredoc_body`.
+    pub fn set_in_command_substitution(&mut self) {
+        self.in_command_substitution = true;
     }
 
     pub fn register_heredoc(&mut self, delimiter: String, strip_tabs: bool) {
@@ -153,10 +180,25 @@ impl<'a> Lexer<'a> {
     /// Handles nesting for `(`/`)` and `{`/`}` pairs; `` ` `` and quotes are
     /// their own delimiter (open == close).
     fn scan_matched(&mut self, open: u8, close: u8, name: &'static str) -> Result<String, LexError> {
+        Ok(self.scan_matched_parts(open, close, name)?.0)
+    }
+
+    /// Returns the span and its STRUCTURE: the same text with every quoted or
+    /// substituted region dropped. Only the structure can answer the
+    /// arithmetic tie-break, because `(( $(case x in x) esac);; ))` holds a
+    /// `)` that closes a case pattern and belongs to nobody out here.
+    fn scan_matched_parts(
+        &mut self,
+        open: u8,
+        close: u8,
+        name: &'static str,
+    ) -> Result<(String, String), LexError> {
         let start = self.pos;
         let mut depth = 0i32;
         let mut out = Vec::new();
+        let mut structure = Vec::new();
         out.push(self.bump().unwrap()); // consume opening delimiter
+        structure.push(open);
         if open != close {
             depth = 1;
         }
@@ -185,15 +227,150 @@ impl<'a> Lexer<'a> {
                     let ansi = self.scan_quoted_span(b'\'', true)?;
                     out.extend_from_slice(ansi.as_bytes());
                 }
+                // A nested substitution is a span of its own, never more
+                // depth for this scan: the `)` in `(( $(case x in x) esac) ))`
+                // closes a case pattern and is invisible out here.
+                Some(b'$') if self.peek_at(1) == Some(b'(') => {
+                    self.pos += 1;
+                    out.push(b'$');
+                    out.extend_from_slice(self.scan_dollar_paren()?.as_bytes());
+                }
+                Some(b'$') if self.peek_at(1) == Some(b'{') => {
+                    self.pos += 1;
+                    out.push(b'$');
+                    out.extend_from_slice(self.scan_param_expansion()?.as_bytes());
+                }
+                Some(b'`') => out.extend_from_slice(self.scan_backticks()?.as_bytes()),
                 Some(c) if open != close && c == open => {
                     depth += 1;
                     out.push(self.bump().unwrap());
+                    structure.push(c);
                 }
                 Some(c) if c == close => {
                     out.push(self.bump().unwrap());
+                    structure.push(c);
                     if open == close || { depth -= 1; depth == 0 } {
-                        return Ok(String::from_utf8_lossy(&out).into_owned());
+                        return Ok((
+                            String::from_utf8_lossy(&out).into_owned(),
+                            String::from_utf8_lossy(&structure).into_owned(),
+                        ));
                     }
+                }
+                Some(_) => {
+                    let c = self.bump().unwrap();
+                    out.push(c);
+                    structure.push(c);
+                }
+            }
+        }
+    }
+
+    /// `$(`: arithmetic if the balanced span really is `$((expr))`, otherwise
+    /// a command substitution. `$((echo a); echo b)` ends in `b)`, so it falls
+    /// through to the command-substitution scanner, which is the same
+    /// tie-break bash makes for the bare `((` token.
+    fn scan_dollar_paren(&mut self) -> Result<String, LexError> {
+        if self.peek_at(1) == Some(b'(') {
+            let start = self.pos;
+            if let Ok((span, structure)) =
+                self.scan_matched_parts(b'(', b')', "arithmetic expansion $((...))")
+            {
+                if span.ends_with("))") && is_arith_interior(&structure) {
+                    return Ok(span);
+                }
+            }
+            self.pos = start;
+        }
+        self.scan_command_substitution()
+    }
+
+    /// `$(...)`, `<(...)`, `>(...)`. Counting brackets cannot find the closing
+    /// `)`, because a `)` also ends a case pattern, sits inside a comment, and
+    /// sits inside a heredoc body. Bash's own scanner PARSES the interior and
+    /// takes the `)` the parse stops at, so this does too: `$(case a in a)
+    /// echo z; esac)` closes at the last paren, not the pattern's.
+    ///
+    /// The interior parse is thrown away — the token stays opaque text, and
+    /// the walker re-parses it when the substitution is actually evaluated.
+    fn scan_command_substitution(&mut self) -> Result<String, LexError> {
+        let open = self.pos; // at `(`
+        let inner = open + 1;
+        let end = crate::parser::scan_until_unmatched_rparen(&self.text[inner..])
+            .map_err(|e| LexError::CommandSubstitution(open, e.to_string()))?;
+        self.pos = inner + end + 1; // past the `)`
+        Ok(self.text[open..self.pos].to_string())
+    }
+
+    /// `${...}` ends at the FIRST unescaped `}`: a bare `{` inside does not
+    /// nest, so `${IFS+d{}}` is the word `${IFS+d{}` followed by a literal
+    /// `}`. Nested `${`, `$(`, backticks and quoted spans are recursed into,
+    /// which is what keeps `${x:-$(echo })}` and `${x-'}'}` whole.
+    fn scan_param_expansion(&mut self) -> Result<String, LexError> {
+        let start = self.pos;
+        let mut out = Vec::new();
+        out.push(self.bump().unwrap()); // `{`
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(LexError::UnterminatedBracket(
+                        "parameter expansion ${...}",
+                        start,
+                    ))
+                }
+                Some(b'}') => {
+                    out.push(self.bump().unwrap());
+                    return Ok(String::from_utf8_lossy(&out).into_owned());
+                }
+                Some(b'\\') => {
+                    out.push(self.bump().unwrap());
+                    if let Some(c) = self.bump() {
+                        out.push(c);
+                    }
+                }
+                Some(c @ (b'\'' | b'"')) => {
+                    out.extend_from_slice(self.scan_quoted(c)?.as_bytes());
+                }
+                Some(b'`') => out.extend_from_slice(self.scan_backticks()?.as_bytes()),
+                Some(b'$') if self.peek_at(1) == Some(b'\'') => {
+                    self.pos += 1;
+                    out.push(b'$');
+                    out.extend_from_slice(self.scan_quoted_span(b'\'', true)?.as_bytes());
+                }
+                Some(b'$') if self.peek_at(1) == Some(b'(') => {
+                    self.pos += 1;
+                    out.push(b'$');
+                    out.extend_from_slice(self.scan_dollar_paren()?.as_bytes());
+                }
+                Some(b'$') if self.peek_at(1) == Some(b'{') => {
+                    self.pos += 1;
+                    out.push(b'$');
+                    out.extend_from_slice(self.scan_param_expansion()?.as_bytes());
+                }
+                Some(_) => out.push(self.bump().unwrap()),
+            }
+        }
+    }
+
+    /// `` `...` `` tracks no quote state at all — the span ends at the first
+    /// backtick a backslash did not escape. bash rejects `` `echo "a`b"` ``
+    /// as an unterminated backtick rather than reading the inner one as
+    /// quoted text.
+    fn scan_backticks(&mut self) -> Result<String, LexError> {
+        let start = self.pos;
+        let mut out = Vec::new();
+        out.push(self.bump().unwrap()); // opening backtick
+        loop {
+            match self.peek() {
+                None => return Err(LexError::UnterminatedBracket("backtick substitution", start)),
+                Some(b'\\') => {
+                    out.push(self.bump().unwrap());
+                    if let Some(c) = self.bump() {
+                        out.push(c);
+                    }
+                }
+                Some(b'`') => {
+                    out.push(self.bump().unwrap());
+                    return Ok(String::from_utf8_lossy(&out).into_owned());
                 }
                 Some(_) => out.push(self.bump().unwrap()),
             }
@@ -221,6 +398,11 @@ impl<'a> Lexer<'a> {
                         out.push(c);
                     }
                 }
+                // Line continuation. bash removes it before tokenizing, in
+                // double quotes as well as out of them, but never inside
+                // single quotes: `"a\<newline>b"` is `ab`, `'a\<newline>b'`
+                // keeps both characters.
+                Some(b'\\') if quote == b'"' && self.peek_at(1) == Some(b'\n') => self.pos += 2,
                 Some(b'\\') if quote == b'"' => {
                     out.push(self.bump().unwrap());
                     if let Some(c) = self.bump() {
@@ -235,17 +417,17 @@ impl<'a> Lexer<'a> {
                 Some(b'$') if quote == b'"' && self.peek_at(1) == Some(b'(') => {
                     self.pos += 1;
                     out.push(b'$');
-                    let span = self.scan_matched(b'(', b')', "command substitution $(...)")?;
+                    let span = self.scan_dollar_paren()?;
                     out.extend_from_slice(span.as_bytes());
                 }
                 Some(b'$') if quote == b'"' && self.peek_at(1) == Some(b'{') => {
                     self.pos += 1;
                     out.push(b'$');
-                    let span = self.scan_matched(b'{', b'}', "parameter expansion ${...}")?;
+                    let span = self.scan_param_expansion()?;
                     out.extend_from_slice(span.as_bytes());
                 }
                 Some(b'`') if quote == b'"' => {
-                    let span = self.scan_matched(b'`', b'`', "backtick substitution")?;
+                    let span = self.scan_backticks()?;
                     out.extend_from_slice(span.as_bytes());
                 }
                 Some(c) if c == quote => {
@@ -286,38 +468,24 @@ impl<'a> Lexer<'a> {
                     text.extend_from_slice(self.scan_quoted_span(b'\'', true)?.as_bytes());
                 }
                 Some(b'`') => {
-                    text.extend_from_slice(
-                        self.scan_matched(b'`', b'`', "backtick substitution")?.as_bytes(),
-                    );
+                    text.extend_from_slice(self.scan_backticks()?.as_bytes());
                 }
-                // `$((...))` needs no special case: the depth counter takes
-                // the whole balanced span, and arithmetic-vs-command-
-                // substitution is the EXPANDER's decision (bash's own
-                // tie-break), not the lexer's. A previous special arm here
-                // dropped the first `(` and silently corrupted `$((x+1))`
-                // into `$(x+1))` — found by a walker end-to-end test.
                 Some(b'$') if self.peek_at(1) == Some(b'(') => {
                     self.pos += 1; // consume "$"
                     text.push(b'$');
-                    text.extend_from_slice(
-                        self.scan_matched(b'(', b')', "command substitution $(...)")?.as_bytes(),
-                    );
+                    text.extend_from_slice(self.scan_dollar_paren()?.as_bytes());
                 }
                 Some(b'$') if self.peek_at(1) == Some(b'{') => {
                     self.pos += 1;
                     text.push(b'$');
-                    text.extend_from_slice(
-                        self.scan_matched(b'{', b'}', "parameter expansion ${...}")?.as_bytes(),
-                    );
+                    text.extend_from_slice(self.scan_param_expansion()?.as_bytes());
                 }
                 // Process substitution is a word-level construct (it expands
                 // to a filename), not a redirect: `diff <(sort a) <(sort b)`.
                 Some(c @ (b'<' | b'>')) if self.peek_at(1) == Some(b'(') => {
                     self.pos += 1;
                     text.push(c);
-                    text.extend_from_slice(
-                        self.scan_matched(b'(', b')', "process substitution")?.as_bytes(),
-                    );
+                    text.extend_from_slice(self.scan_command_substitution()?.as_bytes());
                 }
                 // Array assignment: `x=(a b)` is one word; `(` is otherwise
                 // a boundary. Only after a literal `=` so ordinary words
@@ -327,6 +495,7 @@ impl<'a> Lexer<'a> {
                         self.scan_matched(b'(', b')', "array assignment")?.as_bytes(),
                     );
                 }
+                Some(b'\\') if self.peek_at(1) == Some(b'\n') => self.pos += 2,
                 Some(b'\\') => {
                     text.push(self.bump().unwrap());
                     if let Some(c) = self.bump() {
@@ -387,9 +556,7 @@ impl<'a> Lexer<'a> {
                     None | Some(b' ') | Some(b'\t') | Some(b'\n') => break,
                     Some(b'\'') => chunk.extend_from_slice(self.scan_quoted(b'\'')?.as_bytes()),
                     Some(b'"') => chunk.extend_from_slice(self.scan_quoted(b'"')?.as_bytes()),
-                    Some(b'`') => chunk.extend_from_slice(
-                        self.scan_matched(b'`', b'`', "backtick substitution")?.as_bytes(),
-                    ),
+                    Some(b'`') => chunk.extend_from_slice(self.scan_backticks()?.as_bytes()),
                     // `$'...'` before the bare-quote arms, so its own escaping
                     // applies and `\'` does not close the chunk early.
                     Some(b'$') if self.peek_at(1) == Some(b'\'') => {
@@ -400,17 +567,24 @@ impl<'a> Lexer<'a> {
                     Some(b'$') if self.peek_at(1) == Some(b'(') => {
                         self.pos += 1;
                         chunk.push(b'$');
-                        chunk.extend_from_slice(
-                            self.scan_matched(b'(', b')', "command substitution $(...)")?.as_bytes(),
-                        );
+                        chunk.extend_from_slice(self.scan_dollar_paren()?.as_bytes());
                     }
                     Some(b'$') if self.peek_at(1) == Some(b'{') => {
                         self.pos += 1;
                         chunk.push(b'$');
+                        chunk.extend_from_slice(self.scan_param_expansion()?.as_bytes());
+                    }
+                    // In regex position a paren group is part of the operand,
+                    // and it may hold blanks: `[[ $v =~ (one two) ]]`.
+                    Some(b'(') if regex => {
                         chunk.extend_from_slice(
-                            self.scan_matched(b'{', b'}', "parameter expansion ${...}")?.as_bytes(),
+                            self.scan_matched(b'(', b')', "regex group")?.as_bytes(),
                         );
                     }
+                    Some(b'[') => match self.scan_subscript() {
+                        Some(span) => chunk.extend_from_slice(span.as_bytes()),
+                        None => chunk.push(self.bump().unwrap()),
+                    },
                     Some(b'(') if !regex => {
                         if matches!(chunk.last(), Some(b'?' | b'*' | b'+' | b'@' | b'!')) {
                             chunk.extend_from_slice(
@@ -442,6 +616,45 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A `[`...`]` span inside `[[ ]]` is one piece of a word, parens and all:
+    /// `index[7<(4+2)]` is a single chunk. An unmatched `[` is ordinary text
+    /// (`[[ a[ == b ]]` is legal in bash), so this looks before it consumes,
+    /// and never crosses a blank.
+    fn scan_subscript(&mut self) -> Option<String> {
+        let mut i = self.pos;
+        let mut depth = 0i32;
+        while let Some(c) = self.src.get(i).copied() {
+            match c {
+                b' ' | b'\t' | b'\n' => return None,
+                b'\\' => i += 1,
+                // A quoted `]` closes nothing: `[[ ']' =~ [']'] ]]` is bash.
+                b'\'' | b'"' => {
+                    i += 1;
+                    while self.src.get(i).copied() != Some(c) {
+                        match self.src.get(i) {
+                            None => return None,
+                            Some(b'\\') if c == b'"' => i += 1,
+                            Some(_) => {}
+                        }
+                        i += 1;
+                    }
+                }
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let span = String::from_utf8_lossy(&self.src[self.pos..=i]).into_owned();
+                        self.pos = i + 1;
+                        return Some(span);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
     fn capture_pending_heredocs(&mut self) {
         let pending = std::mem::take(&mut self.pending_heredocs);
         for (delimiter, strip_tabs) in pending {
@@ -464,7 +677,8 @@ impl<'a> Lexer<'a> {
             while !matches!(self.peek(), None | Some(b'\n')) {
                 self.pos += 1;
             }
-            let line = String::from_utf8_lossy(&self.src[line_start..self.pos]).into_owned();
+            let line_end = self.pos;
+            let line = String::from_utf8_lossy(&self.src[line_start..line_end]).into_owned();
             let had_newline = self.peek() == Some(b'\n');
             if had_newline {
                 self.pos += 1;
@@ -472,6 +686,17 @@ impl<'a> Lexer<'a> {
             let compare = if strip_tabs { line.trim_start_matches('\t') } else { line.as_str() };
             if compare == delimiter {
                 break;
+            }
+            // Inside a command substitution the delimiter only has to BEGIN
+            // the line: bash ends the body there and carries on parsing the
+            // rest of it, which is what lets `$(cat <<EOF ... EOF)` close
+            // both the heredoc and the substitution on one line. Outside one,
+            // `EOFX` does not end an `EOF` heredoc.
+            if self.in_command_substitution {
+                if let Some(rest) = compare.strip_prefix(delimiter) {
+                    self.pos = line_end - rest.len();
+                    break;
+                }
             }
             body.push_str(compare);
             body.push('\n');
@@ -484,6 +709,7 @@ impl<'a> Lexer<'a> {
 
     pub fn next_token(&mut self) -> Result<Token, LexError> {
         self.skip_blanks();
+        self.token_start = self.pos;
         match self.peek() {
             None => {
                 if !self.pending_heredocs.is_empty() {
@@ -555,8 +781,10 @@ impl<'a> Lexer<'a> {
                 // itself parenthesized (`((echo a); echo b)`), so rewind and
                 // emit a plain `(`. Mirrors bash's own lookahead-to-`))`.
                 let start = self.pos;
-                match self.scan_matched(b'(', b')', "arithmetic command ((...))") {
-                    Ok(text) if text.ends_with("))") && is_arith_interior(&text) => {
+                match self.scan_matched_parts(b'(', b')', "arithmetic command ((...))") {
+                    Ok((text, structure))
+                        if text.ends_with("))") && is_arith_interior(&structure) =>
+                    {
                         Ok(Token::Arith(text))
                     }
                     _ => {

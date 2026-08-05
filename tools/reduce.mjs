@@ -8,8 +8,14 @@
 // than stopping at the first.
 //
 //   node tools/reduce.mjs ~/repos/gnu/bash/tests/redir.tests
+//
+// With no argument it sweeps every .tests and .sub file bash itself accepts
+// and names the ones this parser rejects, which is the whole-suite check
+// before and after a change.
+//
+//   node tools/reduce.mjs
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 
 const BASH = process.env.BASH_ORACLE ?? `${process.env.HOME}/repos/gnu/bash/bash`;
 const CHECK = new URL("../target/debug/examples/parse_check", import.meta.url).pathname;
@@ -28,8 +34,20 @@ const ours = (src) => run(CHECK, [], src);
 
 const path = process.argv[2];
 if (!path) {
-  console.error("usage: reduce.mjs SCRIPT");
-  process.exit(2);
+  const dir = `${process.env.HOME}/repos/gnu/bash/tests`;
+  let rejected = 0;
+  for (const name of readdirSync(dir).sort()) {
+    if (!/\.(tests|sub)$/.test(name)) continue;
+    const src = readFileSync(`${dir}/${name}`, "utf8");
+    if (!bashOk(src)) continue;
+    const r = ours(src);
+    if (!r.ok) {
+      rejected++;
+      console.log(`${name}: ${r.err}`);
+    }
+  }
+  console.log(`\n${rejected} of bash's own test files this parser rejects`);
+  process.exit(0);
 }
 const lines = readFileSync(path, "utf8").split("\n");
 
