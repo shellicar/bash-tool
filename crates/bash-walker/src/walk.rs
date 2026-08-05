@@ -115,6 +115,11 @@ pub struct Exec<'a> {
 
 const DECL_BUILTINS: &[&str] = &["export", "local", "declare", "readonly", "typeset"];
 
+/// Where `{v}>f` starts looking for a free descriptor. bash reserves
+/// everything below 10 for the script's own explicit numbering, so the first
+/// one it hands out is 10, the next 11.
+const SHELL_FD_BASE: u32 = 10;
+
 impl<'a> Exec<'a> {
     /// An anonymous temp file: created then immediately unlinked, alive only
     /// through its handle — capture buffers and heredoc feeds need no
@@ -1031,6 +1036,19 @@ impl<'a> Exec<'a> {
         let mut c = ctx.clone();
         c.derived = true;
         for r in redirects {
+            // `{v}>f` asks the shell for a descriptor rather than naming one.
+            // The number it picks is stored in the variable and outlives the
+            // redirect, even though the descriptor itself does not.
+            let fd = match &r.fd_var {
+                None => r.fd,
+                Some(name) => {
+                    let n = (SHELL_FD_BASE..)
+                        .find(|n| !c.fds.contains_key(n))
+                        .expect("a free descriptor");
+                    self.state.set_var(name, n.to_string());
+                    Some(n)
+                }
+            };
             match r.op {
                 RedirectOp::Out | RedirectOp::Append => {
                     let path = expand::expand_redirect_target(self, &c, &r.target)?;
@@ -1042,11 +1060,33 @@ impl<'a> Exec<'a> {
                         .mode(self.state.create_mode())
                         .open(self.state.resolve(&path))
                         .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
-                    match r.fd {
+                    match fd {
                         None | Some(1) => c.stdout = Arc::new(f),
                         Some(2) => c.stderr = Arc::new(f),
                         Some(n) => {
                             c.fds.insert(n, Arc::new(f));
+                        }
+                    }
+                }
+                // `<>` opens for reading and writing at once: it creates the
+                // file if it is missing, and never truncates, so a write lands
+                // over the start of what was there and leaves the rest.
+                RedirectOp::ReadWrite => {
+                    let path = expand::expand_redirect_target(self, &c, &r.target)?;
+                    let f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .mode(self.state.create_mode())
+                        .open(self.state.resolve(&path))
+                        .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
+                    let f = Arc::new(f);
+                    match fd {
+                        None | Some(0) => c.stdin = Some(f),
+                        Some(1) => c.stdout = f,
+                        Some(2) => c.stderr = f,
+                        Some(n) => {
+                            c.fds.insert(n, f);
                         }
                     }
                 }
@@ -1068,11 +1108,16 @@ impl<'a> Exec<'a> {
                     let path = expand::expand_redirect_target(self, &c, &r.target)?;
                     let f = File::open(self.state.resolve(&path))
                         .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
-                    c.stdin = Some(Arc::new(f));
+                    match (&r.fd_var, fd) {
+                        (Some(_), Some(n)) => {
+                            c.fds.insert(n, Arc::new(f));
+                        }
+                        _ => c.stdin = Some(Arc::new(f)),
+                    }
                 }
                 RedirectOp::DupOut => {
                     let target = expand::expand_redirect_target(self, &c, &r.target)?;
-                    let src = r.fd.unwrap_or(1);
+                    let src = fd.unwrap_or(1);
                     match target.as_str() {
                         "-" => {
                             return Err(Flow::Fatal(
@@ -1102,7 +1147,7 @@ impl<'a> Exec<'a> {
                             }
                         }
                         // `>& file` (no fd, non-numeric): both streams to it.
-                        path if r.fd.is_none() => {
+                        path if fd.is_none() => {
                             let f = std::fs::OpenOptions::new()
                                 .create(true)
                                 .write(true)

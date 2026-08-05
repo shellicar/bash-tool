@@ -300,13 +300,20 @@ impl<'a> Parser<'a> {
         let mut redirects = Vec::new();
         loop {
             match self.peek()? {
-                Token::Great | Token::DGreat | Token::Less | Token::DLess | Token::DLessDash
-                | Token::DLessLess | Token::GreatAmp | Token::GreatPipe | Token::LessAmp
-                | Token::AmpGreat | Token::AmpDGreat => redirects.push(self.parse_redirect(None)?),
+                Token::Great | Token::DGreat | Token::Less | Token::LessGreat | Token::DLess
+                | Token::DLessDash | Token::DLessLess | Token::GreatAmp | Token::GreatPipe
+                | Token::LessAmp | Token::AmpGreat | Token::AmpDGreat => {
+                    redirects.push(self.parse_redirect(None, None)?)
+                }
                 Token::Fd(n) => {
                     let n = *n;
                     self.advance()?;
-                    redirects.push(self.parse_redirect(Some(n))?);
+                    redirects.push(self.parse_redirect(Some(n), None)?);
+                }
+                Token::FdVar(name) => {
+                    let name = name.clone();
+                    self.advance()?;
+                    redirects.push(self.parse_redirect(None, Some(name))?);
                 }
                 _ => break,
             }
@@ -538,15 +545,20 @@ impl<'a> Parser<'a> {
                         args.push(Word { text: w, quoted });
                     }
                 }
-                Token::Great | Token::DGreat | Token::Less | Token::DLess | Token::DLessDash
-                | Token::DLessLess | Token::GreatAmp | Token::GreatPipe | Token::LessAmp
-                | Token::AmpGreat | Token::AmpDGreat => {
-                    redirects.push(self.parse_redirect(None)?);
+                Token::Great | Token::DGreat | Token::Less | Token::LessGreat | Token::DLess
+                | Token::DLessDash | Token::DLessLess | Token::GreatAmp | Token::GreatPipe
+                | Token::LessAmp | Token::AmpGreat | Token::AmpDGreat => {
+                    redirects.push(self.parse_redirect(None, None)?);
                 }
                 Token::Fd(n) => {
                     let n = *n;
                     self.advance()?;
-                    redirects.push(self.parse_redirect(Some(n))?);
+                    redirects.push(self.parse_redirect(Some(n), None)?);
+                }
+                Token::FdVar(name) => {
+                    let name = name.clone();
+                    self.advance()?;
+                    redirects.push(self.parse_redirect(None, Some(name))?);
                 }
                 _ => break,
             }
@@ -558,7 +570,11 @@ impl<'a> Parser<'a> {
         Ok(Command::Simple(SimpleCommand { assignments, program, args, redirects }))
     }
 
-    fn parse_redirect(&mut self, fd: Option<u32>) -> Result<Redirect, ParseError> {
+    fn parse_redirect(
+        &mut self,
+        fd: Option<u32>,
+        fd_var: Option<String>,
+    ) -> Result<Redirect, ParseError> {
         let op = match self.advance()? {
             Token::Great => RedirectOp::Out,
             // `>|` is `>` with noclobber overridden, and the two differ only
@@ -567,6 +583,7 @@ impl<'a> Parser<'a> {
             Token::GreatPipe => RedirectOp::Out,
             Token::DGreat => RedirectOp::Append,
             Token::Less => RedirectOp::In,
+            Token::LessGreat => RedirectOp::ReadWrite,
             Token::DLess => RedirectOp::Heredoc,
             Token::DLessDash => RedirectOp::HeredocStrip,
             Token::DLessLess => RedirectOp::HereString,
@@ -600,7 +617,7 @@ impl<'a> Parser<'a> {
             }
             _ => {}
         }
-        Ok(Redirect { op, fd, target, heredoc_body: None })
+        Ok(Redirect { op, fd, fd_var, target, heredoc_body: None })
     }
 }
 
@@ -652,6 +669,7 @@ fn merge_stderr_into_stdout(cmd: Command) -> Command {
     let merge = Redirect {
         op: RedirectOp::DupOut,
         fd: Some(2),
+        fd_var: None,
         target: Word { text: "1".to_string(), quoted: false },
         heredoc_body: None,
     };
@@ -1082,6 +1100,40 @@ mod tests {
             "[[ ${v} =~ (one two) ]]",
         ] {
             parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn read_write_redirect_is_its_own_operator() {
+        let cmd = parse("exec 6<>/tmp/f").unwrap();
+        let r = &simple(&cmd).redirects[0];
+        assert_eq!((r.op, r.fd, r.target.text.as_str()), (RedirectOp::ReadWrite, Some(6), "/tmp/f"));
+        let cmd = parse("cat <>/tmp/f").unwrap();
+        assert_eq!(simple(&cmd).redirects[0].fd, None);
+    }
+
+    #[test]
+    fn a_braced_name_against_a_redirect_operator_names_a_variable_not_a_word() {
+        let cmd = parse("echo hi {v}>>/tmp/f").unwrap();
+        let s = simple(&cmd);
+        assert_eq!(s.args.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(), vec!["hi"]);
+        assert_eq!(s.redirects[0].fd_var.as_deref(), Some("v"));
+        assert_eq!(s.redirects[0].op, RedirectOp::Append);
+        for src in ["exec {v}</tmp/f", "exec {v}<>/tmp/f", "exec {_x9}>/tmp/f"] {
+            let cmd = parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            assert!(simple(&cmd).redirects[0].fd_var.is_some(), "for {src:?}");
+        }
+    }
+
+    #[test]
+    fn a_braced_word_that_is_not_a_descriptor_variable_stays_an_argument() {
+        // bash needs an identifier in the braces AND the operator hard
+        // against them. Each of these is an ordinary word plus a redirect.
+        for src in ["echo {a} >/tmp/f", "echo {a,b}>/tmp/f", "echo {1..2}>/tmp/f", "echo {}>/tmp/f"] {
+            let cmd = parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            let s = simple(&cmd);
+            assert!(s.redirects[0].fd_var.is_none(), "for {src:?}");
+            assert_eq!(s.args.len(), 1, "for {src:?}");
         }
     }
 

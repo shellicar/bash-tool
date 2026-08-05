@@ -36,8 +36,7 @@ pub enum Connector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RedirectOp {
     // The corpus-scoped forms (docs/ast-execution.md feature-prevalence
-    // table). Bash's real grammar has 19 r_instruction variants; still
-    // unrepresented: `<>`, `{fd}>file` REDIR_WORD forms.
+    // table). Bash's real grammar has 19 r_instruction variants.
     Out,          // >
     Append,       // >>
     In,           // <
@@ -48,12 +47,23 @@ pub enum RedirectOp {
     Heredoc,      // <<
     HeredocStrip, // <<-
     HereString,   // <<<
+    /// `<>` — opens for both reading and writing, creating the file if it is
+    /// missing and never truncating it. Distinct from `>` and `<` in a way
+    /// neither can stand in for: `exec 6<>f; echo -n ab >&6` overwrites the
+    /// first two bytes of f and leaves the rest.
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Redirect {
     pub op: RedirectOp,
     pub fd: Option<u32>,
+    /// The `{name}` form (bash's `REDIR_VARASSIGN`): instead of naming a
+    /// descriptor, the redirect asks the shell to pick a free one and store
+    /// its number in this variable. Set only when the word `{name}` sits
+    /// immediately against the operator and `name` is an identifier, which is
+    /// what tells `{v}>f` apart from the argument `{a,b}` in `echo {a,b} >f`.
+    pub fd_var: Option<String>,
     pub target: Word,
     /// Populated only for `Heredoc`/`HeredocStrip`: the captured raw body
     /// text, read verbatim (never tokenized as bash syntax) between the

@@ -510,6 +510,9 @@ fn redirect_is_pure(r: &Redirect, assigned: &HashSet<String>, mode: Mode) -> boo
         RedirectOp::HereString => word_is_pure(&r.target, assigned, mode, false),
         RedirectOp::In => mode == Mode::LocalBash && word_is_pure(&r.target, assigned, mode, false),
         RedirectOp::DupOut | RedirectOp::DupIn => mode == Mode::LocalBash,
+        // `<>` writes over an existing file in place, so there is no target
+        // it could touch harmlessly.
+        RedirectOp::ReadWrite => false,
         RedirectOp::Out | RedirectOp::Append | RedirectOp::OutErr | RedirectOp::AppendOutErr => {
             // Writes only where they cannot touch anything real: /dev/null,
             // or a bare relative name inside the per-command scratch cwd.

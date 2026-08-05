@@ -1451,3 +1451,66 @@ fn clobbering_redirect_writes_the_file() {
 
     assert_eq!(actual, expected);
 }
+
+
+/// `<>` opens for reading and writing without truncating, so a write lands
+/// over the start of the file and leaves the rest. bash prints `abIGINAL`.
+#[test]
+fn read_write_redirect_overwrites_in_place_without_truncating() {
+    let expected = "abIGINAL\n";
+    let path = "/tmp/walker-readwrite";
+    std::fs::write(path, "ORIGINAL\n").unwrap();
+
+    let (actual, _) = run(&format!("exec 6<>{path}; echo -n ab >&6; cat {path}"));
+
+    assert_eq!(actual, expected);
+}
+
+/// `<>` creates a missing file, same as `>`.
+#[test]
+fn read_write_redirect_creates_a_missing_file() {
+    let expected = "made\n";
+    let path = "/tmp/walker-readwrite-new";
+    let _ = std::fs::remove_file(path);
+
+    let (actual, _) = run(&format!("exec 7<>{path}; echo made >&7; cat {path}"));
+
+    assert_eq!(actual, expected);
+}
+
+/// `{v}>file` opens on a descriptor the shell picks and stores the number in
+/// the named variable. bash hands out 10 first, then 11.
+#[test]
+fn a_descriptor_variable_redirect_reports_the_fd_the_shell_chose() {
+    let expected = "10 11\nbody\n";
+
+    let (actual, _) = run(
+        "exec {a}>/tmp/walker-fdvar-a; exec {b}>/tmp/walker-fdvar-b; echo $a $b; \
+         echo body >&$a; cat /tmp/walker-fdvar-a",
+    );
+
+    assert_eq!(actual, expected);
+}
+
+/// The number outlives the redirect even on an ordinary command, and
+/// overwrites whatever the variable held.
+#[test]
+fn a_descriptor_variable_keeps_its_number_after_the_command() {
+    let expected = "x\nq=10\n";
+
+    let (actual, _) = run("v=9; echo x {q}>/tmp/walker-fdvar-c; echo q=$q");
+
+    assert_eq!(actual, expected);
+}
+
+/// Only `{identifier}` hard against the operator is a descriptor variable.
+/// `{a} >f` is an argument then a redirect, and `{a,b}>f` is brace expansion.
+#[test]
+fn a_braced_word_that_is_not_a_descriptor_variable_stays_an_argument() {
+    let expected = "a=[]\nhi {a}\n";
+
+    let (actual, _) =
+        run("echo hi {a} >/tmp/walker-fdvar-d; echo \"a=[$a]\"; cat /tmp/walker-fdvar-d");
+
+    assert_eq!(actual, expected);
+}

@@ -22,6 +22,13 @@ pub enum Token {
     /// the AST printer: `2>&1` was silently splitting into a bogus `"2"`
     /// argument plus an fd-less `>&1` redirect before this existed).
     Fd(u32),
+    /// A `{name}` standing immediately against `<`/`>`, `name` an identifier:
+    /// the redirect asks the shell for a free descriptor and stores its
+    /// number in that variable. Both halves of the rule are load-bearing —
+    /// `echo {a} >f` is an argument then a redirect, and `echo {a,b}>f` is a
+    /// brace expansion, because neither is `{identifier}` against the
+    /// operator.
+    FdVar(String),
     /// A `((...))` arithmetic-command span, delimiters included, interior
     /// opaque — the same deferred treatment as `$((...))`. Only emitted when
     /// the balanced span really ends in `))`; `((echo a); echo b)` falls back
@@ -43,6 +50,7 @@ pub enum Token {
     Great,     // >
     DGreat,    // >>
     Less,      // <
+    LessGreat, // <>
     DLess,     // <<
     DLessDash, // <<-
     DLessLess, // <<<
@@ -655,6 +663,29 @@ impl<'a> Lexer<'a> {
         None
     }
 
+    /// The length of a `{name}` descriptor-variable prefix at the current
+    /// position, or `None` if what stands there is an ordinary word. bash
+    /// wants an identifier in the braces and the operator hard against the
+    /// closing one, which is what leaves `{a,b}>f`, `{1..2}>f`, `{}>f` and
+    /// `{a} >f` as plain words.
+    fn fd_var_len(&self) -> Option<usize> {
+        let mut i = self.pos + 1;
+        let first = self.src.get(i).copied()?;
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None;
+        }
+        while matches!(self.src.get(i), Some(c) if c.is_ascii_alphanumeric() || *c == b'_') {
+            i += 1;
+        }
+        if self.src.get(i) != Some(&b'}') {
+            return None;
+        }
+        match self.src.get(i + 1) {
+            Some(b'<') | Some(b'>') => Some(i + 1 - self.pos),
+            _ => None,
+        }
+    }
+
     fn capture_pending_heredocs(&mut self) {
         let pending = std::mem::take(&mut self.pending_heredocs);
         for (delimiter, strip_tabs) in pending {
@@ -817,6 +848,10 @@ impl<'a> Lexer<'a> {
                 self.pos += 2;
                 Ok(Token::LessAmp)
             }
+            Some(b'<') if self.peek_at(1) == Some(b'>') => {
+                self.pos += 2;
+                Ok(Token::LessGreat)
+            }
             Some(b'<') if self.peek_at(1) == Some(b'(') => {
                 let (text, quoted) = self.scan_word()?;
                 Ok(Token::Word(text, quoted))
@@ -844,6 +879,13 @@ impl<'a> Lexer<'a> {
             Some(b'>') => {
                 self.pos += 1;
                 Ok(Token::Great)
+            }
+            Some(b'{') if self.fd_var_len().is_some() => {
+                let len = self.fd_var_len().expect("checked");
+                let name =
+                    String::from_utf8_lossy(&self.src[self.pos + 1..self.pos + len - 1]).into_owned();
+                self.pos += len;
+                Ok(Token::FdVar(name))
             }
             Some(c) if c.is_ascii_digit() => {
                 let start = self.pos;
