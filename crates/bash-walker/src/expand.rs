@@ -1244,25 +1244,42 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
         return Ok(Expanded::One(chars[start..end.max(start)].iter().collect()));
     }
 
-    // ${x^^} ${x,,} ${x^} ${x,}
-    match op {
-        "^^" => return Ok(Expanded::One(value.to_uppercase())),
-        ",," => return Ok(Expanded::One(value.to_lowercase())),
-        "^" => {
-            let mut cs = value.chars();
-            return Ok(Expanded::One(match cs.next() {
-                Some(c) => c.to_uppercase().collect::<String>() + cs.as_str(),
-                None => value,
-            }));
+    // ${x^^pat} ${x,,pat} ${x^pat} ${x,pat}. The pattern is optional and
+    // matched against one character at a time, so `${v^^[aeiou]}` raises the
+    // vowels and leaves everything else. Absent, every character matches.
+    for (marker, all, upper) in [("^^", true, true), (",,", true, false), ("^", false, true), (",", false, false)] {
+        let Some(pat) = op.strip_prefix(marker) else {
+            continue;
+        };
+        let matches: Box<dyn Fn(char) -> bool> = if pat.is_empty() {
+            Box::new(|_| true)
+        } else {
+            let pat = word_of(ex, pat)?;
+            let g = glob::Pattern::new(&pat)
+                .map_err(|e| Flow::Fatal(format!("bad pattern {pat:?}: {e}")))?;
+            Box::new(move |c: char| g.matches(&c.to_string()))
+        };
+        let convert = |c: char| -> String {
+            if upper {
+                c.to_uppercase().collect()
+            } else {
+                c.to_lowercase().collect()
+            }
+        };
+        let mut out = String::new();
+        let mut done = false;
+        for c in value.chars() {
+            if (all || !done) && matches(c) {
+                out.push_str(&convert(c));
+                done = true;
+            } else {
+                out.push(c);
+                if !all {
+                    done = true;
+                }
+            }
         }
-        "," => {
-            let mut cs = value.chars();
-            return Ok(Expanded::One(match cs.next() {
-                Some(c) => c.to_lowercase().collect::<String>() + cs.as_str(),
-                None => value,
-            }));
-        }
-        _ => {}
+        return Ok(Expanded::One(out));
     }
 
     Err(Flow::Fatal(format!(

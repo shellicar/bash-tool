@@ -1429,3 +1429,21 @@ fn uid_expands_to_the_real_user_id() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn case_modification_raises_every_character_its_pattern_matches() {
+    let expected = "hEllO\n";
+
+    let (actual, _) = run("v=hello; echo ${v^^[aeiou]}");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn case_modification_leaves_a_first_character_its_pattern_misses() {
+    let expected = "hello\n";
+
+    let (actual, _) = run("v=hello; echo ${v^[aeiou]}");
+
+    assert_eq!(actual, expected);
+}
