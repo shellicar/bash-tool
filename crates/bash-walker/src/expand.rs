@@ -326,6 +326,20 @@ fn brace_expand(raw: &str) -> Vec<String> {
                 }
                 i += 1;
             }
+            // A backtick substitution is opaque to brace expansion, the same
+            // as `$(...)`: the inner shell does its own. Without this,
+            // `echo `zecho foo {1,2} bar`` expanded the substitution itself
+            // into two of them and ran the command twice.
+            b'`' => {
+                i += 1;
+                while i < b.len() && b[i] != b'`' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
             b'$' => {
                 // skip the whole ${...}/$(...) span so its braces stay
                 i += 1;
@@ -376,6 +390,50 @@ fn scan_brace_alternatives(b: &[u8], start: usize) -> Option<(Vec<String>, usize
     while i < b.len() {
         match b[i] {
             b'\\' => i += 1,
+            // A comma inside quotes or a substitution belongs to the
+            // alternative rather than separating two of them, so `{"x,x"}`
+            // holds no separator at all and bash leaves the whole thing as
+            // text.
+            b'\'' => {
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'`' => {
+                i += 1;
+                while i < b.len() && b[i] != b'`' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'$' if matches!(b.get(i + 1), Some(b'{') | Some(b'(')) => {
+                let (open, close) = if b[i + 1] == b'{' { (b'{', b'}') } else { (b'(', b')') };
+                i += 1;
+                let mut inner_depth = 0;
+                while i < b.len() {
+                    if b[i] == open {
+                        inner_depth += 1;
+                    } else if b[i] == close {
+                        inner_depth -= 1;
+                        if inner_depth == 0 {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;
@@ -437,7 +495,14 @@ fn range_alternatives(inner: &str) -> Option<Vec<String>> {
         }
         return Some(out);
     }
+    // Both ends alphabetic or it is not a range at all: bash leaves `{1..f}`
+    // as text rather than counting from '1' to 'f' through the punctuation
+    // between them. The characters BETWEEN the ends are unrestricted, which
+    // is why `{a..A}` walks through ^, ] and the rest.
     let (ac, bc) = (single_char(from)?, single_char(to)?);
+    if !ac.is_ascii_alphabetic() || !bc.is_ascii_alphabetic() {
+        return None;
+    }
     let (mut v, end) = (ac as u32, bc as u32);
     let mut out = Vec::new();
     loop {
@@ -930,6 +995,13 @@ fn param_lookup(ex: &mut Exec, name: &str) -> Option<Expanded> {
         // is the process, which is right everywhere the walker forks and wrong
         // where it uses a thread.
         "BASHPID" => Some(std::process::id().to_string()),
+        // Who the shell is. Missing, these expanded to nothing, and the
+        // arithmetic that reads them then failed on the operator that was
+        // left with no left operand: `(( $UID == 0 ))` became `(( == 0 ))`.
+        // SAFETY: getuid/geteuid cannot fail and touch no shared state.
+        "UID" => Some(unsafe { libc::getuid() }.to_string()),
+        "EUID" => Some(unsafe { libc::geteuid() }.to_string()),
+        "PPID" => Some(std::os::unix::process::parent_id().to_string()),
         d if d.chars().all(|c| c.is_ascii_digit()) => {
             let n: usize = d.parse().unwrap();
             if n == 0 {
