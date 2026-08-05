@@ -169,6 +169,16 @@ The consequence that matters: the conformance suite drives the walker by script
 path, so that gate structurally cannot see this. The two modes it does not test
 are the two the tool is actually used through.
 
+It is also what blocks `nquote4`, and that is where it will surface next.
+`\x{...}` inside `$'...'` yields a BYTE rather than a codepoint: bash masks the
+accumulated value with 0xFF (lib/sh/strtrans.c), so `$'\x{01234567}'` is `g`
+and `$'\x{cd}'` is the single byte 0xCD. Six of that test's eighteen lines
+produce bytes above 0x7F, which a `String` holds as two bytes of UTF-8 against
+bash's one. The decoding itself is right as of e895394 (the braced form, `\x`
+keeping its backslash when no digits follow, and a NUL ending the segment while
+the word carries on); only the representation is left, so the test cannot close
+until this does.
+
 **Arrays.** Unimplemented, and half-silent: subscripts refuse loudly, but
 `arr=(a b c)` is accepted and stores the literal text, so `$arr` gives
 `(a b c)` where bash gives `a`, and `files=(*.log)` does not glob.
