@@ -914,14 +914,16 @@ fn expand_dollar(
     }
 }
 
-/// A parameter's bare value, special names included.
-fn param_value(ex: &mut Exec, name: &str) -> Result<Expanded, Flow> {
+/// A parameter's value, or `None` when it is unset. `${x-word}` and `${x+word}`
+/// turn on that distinction, and a positional past `$#` is unset rather than
+/// empty.
+fn param_lookup(ex: &mut Exec, name: &str) -> Option<Expanded> {
     let v = match name {
         "?" => Some(ex.state.last_status.to_string()),
         "$" => Some(std::process::id().to_string()),
         "!" => ex.state.last_background_pid.map(|p| p.to_string()),
         "#" => Some(ex.state.positional.len().to_string()),
-        "@" | "*" => return Ok(Expanded::Many(ex.state.positional.clone())),
+        "@" | "*" => return Some(Expanded::Many(ex.state.positional.clone())),
         "-" => Some(String::new()),
         "0" => Some(ex.state.script_name.clone()),
         // The pid of the shell itself. Bash re-evaluates it per subshell; this
@@ -941,13 +943,25 @@ fn param_value(ex: &mut Exec, name: &str) -> Result<Expanded, Flow> {
         "PIPESTATUS" => Some(ex.state.pipestatus.first().copied().unwrap_or(0).to_string()),
         _ => ex.state.get_var(name),
     };
-    match v {
-        Some(v) => Ok(Expanded::One(v)),
-        None if ex.state.flags.nounset => {
-            Err(Flow::Fatal(format!("{name}: unbound variable")))
-        }
-        None => Ok(Expanded::One(String::new())),
+    v.map(Expanded::One)
+}
+
+/// A parameter's bare value, special names included.
+fn param_value(ex: &mut Exec, name: &str) -> Result<Expanded, Flow> {
+    match param_lookup(ex, name) {
+        Some(v) => Ok(v),
+        None => Ok(Expanded::One(unset_value(ex, name)?)),
     }
+}
+
+/// What an unset parameter expands to. Under `set -u` bash ends the shell
+/// instead, except in the `${x-word}` family, whose purpose is to supply a
+/// value for a parameter that has none.
+fn unset_value(ex: &Exec, name: &str) -> Result<String, Flow> {
+    if ex.state.flags.nounset {
+        return Err(Flow::Fatal(format!("{name}: unbound variable")));
+    }
+    Ok(String::new())
 }
 
 /// `${...}` operator forms. Anything not implemented errors by name.
@@ -1014,10 +1028,9 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
             "${{{inner}}}: arrays are not supported by bash-walker"
         )));
     }
-    let current = match param_value(ex, name)? {
-        Expanded::One(v) if v.is_empty() && ex.state.get_var(name).is_none() && !is_special(name) => None,
-        Expanded::One(v) => Some(v),
-        many @ Expanded::Many(_) => {
+    let current = match param_lookup(ex, name) {
+        Some(Expanded::One(v)) => Some(v),
+        Some(many @ Expanded::Many(_)) => {
             if op.is_empty() {
                 return Ok(many);
             }
@@ -1025,10 +1038,13 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
                 "${{{inner}}}: operators on $@/$* are not supported by bash-walker"
             )));
         }
-        Expanded::NotSpecial => None,
+        Some(Expanded::NotSpecial) | None => None,
     };
     if op.is_empty() {
-        return Ok(Expanded::One(current.unwrap_or_default()));
+        return match current {
+            Some(v) => Ok(Expanded::One(v)),
+            None => Ok(Expanded::One(unset_value(ex, name)?)),
+        };
     }
 
     let word_of = |ex: &mut Exec, w: &str| -> Result<String, Flow> {
@@ -1089,7 +1105,12 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
         }
     }
 
-    let value = current.unwrap_or_default();
+    // Every operator from here reads the value rather than standing in for a
+    // missing one, so an unset parameter under `set -u` is an error.
+    let value = match current {
+        Some(v) => v,
+        None => unset_value(ex, name)?,
+    };
 
     // ${x#pat} ${x##pat} ${x%pat} ${x%%pat}
     for (pfx, prefix_side, longest) in
@@ -1175,11 +1196,6 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
     Err(Flow::Fatal(format!(
         "${{{inner}}}: this expansion form is not supported by bash-walker"
     )))
-}
-
-fn is_special(name: &str) -> bool {
-    matches!(name, "?" | "$" | "!" | "#" | "@" | "*" | "-" | "0" | "RANDOM" | "BASHPID" | "PIPESTATUS")
-        || name.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Shortest/longest prefix or suffix strip against a glob pattern.

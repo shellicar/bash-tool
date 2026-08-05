@@ -433,6 +433,38 @@ fn parameter_default_applies_when_unset() {
 }
 
 #[test]
+fn an_unset_positional_takes_the_default_word() {
+    let (output, _) = run("set x; shift; echo \"[${1-X}]\"");
+
+    let expected = "[X]\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn a_positional_set_to_empty_keeps_its_own_value() {
+    let (output, _) = run("set -- ''; echo \"[${1-X}]\"");
+
+    let expected = "[]\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn the_default_word_form_is_exempt_from_nounset() {
+    let (output, _) = run("set -u; echo \"[${bw_unset_thing-d}]\"");
+
+    let expected = "[d]\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn nounset_still_fails_an_operator_that_reads_an_unset_parameter() {
+    let (_, status) = run("set -u; echo \"${bw_unset_thing#p}\"");
+
+    let expected = 1;
+    assert_eq!(status, expected);
+}
+
+#[test]
 fn unquoted_expansion_splits_quoted_does_not() {
     let (output, _) = run("x='a b'; printf '[%s]' $x; printf '[%s]' \"$x\"");
 
