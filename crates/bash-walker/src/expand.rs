@@ -797,14 +797,37 @@ fn ansi_c_quote(raw: &str, quote_start: usize) -> (String, usize) {
                 b'e' => ('\x1b', 2),
                 b'f' => ('\x0c', 2),
                 b'v' => ('\x0b', 2),
+                // `\x{...}` takes any number of hex digits and an optional
+                // closing brace. Bash masks the accumulated value with 0xFF
+                // either way (lib/sh/strtrans.c), so the result is one BYTE
+                // and the last two digits are the whole of it: `\x{01234567}`
+                // is 'g'. `\x{}` is therefore a NUL. Above 0x7F this is where
+                // the parked byte-representation gap bites, since a Rust
+                // String holds a codepoint and bash holds the raw byte.
                 b'x' => {
-                    let hex: String = raw[i + 2..]
+                    let braced = raw.as_bytes().get(i + 2) == Some(&b'{');
+                    let start = if braced { i + 3 } else { i + 2 };
+                    let digits: String = raw[start..]
                         .chars()
                         .take_while(|c| c.is_ascii_hexdigit())
-                        .take(2)
+                        .take(if braced { usize::MAX } else { 2 })
                         .collect();
-                    let v = u8::from_str_radix(&hex, 16).unwrap_or(b'x');
-                    (v as char, 2 + hex.len())
+                    // `\x` with no digits at all keeps its backslash, so the
+                    // `x` falls through as ordinary text on the next pass.
+                    if !braced && digits.is_empty() {
+                        out.push('\\');
+                        i += 1;
+                        continue;
+                    }
+                    let v = digits
+                        .chars()
+                        .fold(0u32, |acc, c| (acc << 4) | c.to_digit(16).unwrap_or(0))
+                        & 0xFF;
+                    let mut used = (start - i) + digits.len();
+                    if braced && raw[start + digits.len()..].starts_with('}') {
+                        used += 1;
+                    }
+                    (char::from_u32(v).unwrap_or('\0'), used)
                 }
                 // `\nnn` is up to three octal digits, and `\0` is only NUL
                 // because zero digits follow it. Treating `\0` as its own
@@ -823,6 +846,12 @@ fn ansi_c_quote(raw: &str, quote_start: usize) -> (String, usize) {
             out.push('\\');
             i += 1;
         }
+    }
+    // A NUL ends the segment. Bash builds the value as C text, so `$'ab\x{}cd'`
+    // is "ab", and the rest of the WORD carries on after it: `a$'b\x{}c'd` is
+    // "abd".
+    if let Some(nul) = out.find('\0') {
+        out.truncate(nul);
     }
     (out, i + 1)
 }

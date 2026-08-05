@@ -1456,3 +1456,30 @@ fn a_quoted_brace_does_not_end_a_braced_expansion() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn a_hex_escape_with_no_digits_keeps_its_backslash() {
+    let expected = "\\xzz\n";
+
+    let (actual, _) = run("echo $'\\xzz'");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_braced_hex_escape_is_the_last_two_digits_of_what_it_holds() {
+    let expected = "gX\n";
+
+    let (actual, _) = run("echo $'\\x{01234567}X'");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_nul_ends_the_ansi_c_segment_and_the_word_carries_on() {
+    let expected = "abd\n";
+
+    let (actual, _) = run("echo a$'b\\x{}c'd");
+
+    assert_eq!(actual, expected);
+}
