@@ -16,6 +16,16 @@
 // shells with the streams kept apart compares what each decided, and leaves
 // cross-stream ordering untested, deliberately.
 //
+// Both shells run inside the container built by conformance.Dockerfile, which
+// carries the bash under test, the test files, and one GNU userland. On the
+// host they ran against whatever sed, grep and awk that host had, and BSD and
+// GNU disagree about several: that moves under you, and its failure mode is a
+// false match, where both shells break identically and the gate calls it a
+// pass. The walker is mounted in, so it must be a Linux build:
+//
+//   docker run --rm -v $PWD:/src -w /src -e CARGO_TARGET_DIR=/src/target-linux \
+//     rust:alpine sh -c 'apk add --no-cache musl-dev && cargo build --release -p bash-walker'
+//
 // Exit 0 when every test matched, 1 otherwise, 64 on a bad call.
 
 import { readdirSync, readFileSync, mkdtempSync, writeFileSync, existsSync } from "node:fs";
@@ -24,13 +34,16 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
-const BASH = `${process.env.HOME}/repos/gnu/bash/bash`;
+const IMAGE = "bash-conformance";
+// Paths inside the image, fixed by the Dockerfile.
+const BASH = "/src/bash";
+const WALKER = "/walker";
 // --walker so a session working in its own worktree can point at its own
 // build; several worktrees on this repo is how the work runs in parallel.
 const walkerAt = process.argv.indexOf("--walker");
-const WALKER = walkerAt >= 0 ? process.argv[walkerAt + 1] : `${ROOT}/target/debug/bash-walker`;
+const WALKER_HOST = walkerAt >= 0 ? process.argv[walkerAt + 1] : `${ROOT}/target-linux/release/bash-walker`;
 const TESTS = `${process.env.HOME}/repos/gnu/bash/tests`;
-const TIMEOUT = 20_000;
+const TIMEOUT = 900_000;
 
 const only = process.argv
   .slice(2)
@@ -39,14 +52,14 @@ const verbose = process.argv.includes("--verbose");
 const accept = process.argv.includes("--accept");
 const BASELINE = `${ROOT}/conformance-baseline.json`;
 
-if (!existsSync(BASH)) {
-  console.error(`no bash to compare against at ${BASH}`);
-  console.error("clone and build GNU Bash there, or this measures nothing");
+if (spawnSync("docker", ["image", "inspect", IMAGE], { stdio: "ignore" }).status !== 0) {
+  console.error(`no ${IMAGE} image`);
+  console.error(`cd ~/repos/gnu/bash && docker build --platform linux/amd64 -t ${IMAGE} -f ${ROOT}/tools/conformance.Dockerfile .`);
   process.exit(64);
 }
-if (!existsSync(WALKER)) {
-  console.error(`no walker at ${WALKER}`);
-  console.error("cargo build -p bash-walker, or pass --walker PATH");
+if (!existsSync(WALKER_HOST)) {
+  console.error(`no walker at ${WALKER_HOST}`);
+  console.error("it must be a Linux build; see the cross-build at the top of this file, or pass --walker PATH");
   process.exit(64);
 }
 
@@ -61,29 +74,52 @@ if (names.length === 0) {
   process.exit(64);
 }
 
-// Each run gets its own scratch directory, because the tests write files and
-// a shared one lets an earlier test decide a later one's result.
-function run(shell, name) {
-  const tmp = mkdtempSync(join(tmpdir(), "bashconf-"));
-  const r = spawnSync(shell, [`./${name}.tests`], {
-    cwd: TESTS,
-    encoding: "utf8",
-    timeout: TIMEOUT,
-    maxBuffer: 64 * 1024 * 1024,
-    // `.` on PATH is how run-all finds bash's own helpers, recho, zecho and
-    // printenv. Without them fourteen tests fail on "recho: command not
-    // found", which says nothing about either shell. Build them with:
-    //   cc -o tests/recho support/recho.c   (same for zecho, printenv)
-    env: {
-      ...process.env,
-      PATH: `.:${process.env.PATH}`,
-      TMPDIR: tmp,
-      THIS_SH: shell,
-      BUILD_DIR: `${process.env.HOME}/repos/gnu/bash`,
-    },
-  });
-  return { out: r.stdout ?? "", err: r.stderr ?? "", status: r.status, timedOut: r.error?.code === "ETIMEDOUT" };
+// One container for the whole sweep rather than one per test: 166 starts under
+// emulation costs minutes of nothing. Each test still gets its own scratch
+// directory, because the tests write files and a shared one lets an earlier
+// test decide a later one's result.
+//
+// `.` on PATH is how bash's own runners find its helpers, recho, zecho and
+// printenv; the image builds them beside the tests.
+const RUNNER = `
+set -u
+for n in $NAMES; do
+  d=$(mktemp -d)
+  TMPDIR=$d THIS_SH=$SH BUILD_DIR=/src PATH=.:$PATH \
+    timeout ${Math.floor(TIMEOUT / 1000 / 60)}m $SH ./$n.tests >/out/$n.$TAG.out 2>/out/$n.$TAG.err
+  echo $? > /out/$n.$TAG.status
+done
+`;
+
+function sweep(shell, tag, out) {
+  return spawnSync(
+    "docker",
+    [
+      "run", "--rm", "--platform", "linux/amd64",
+      "-v", `${WALKER_HOST}:${WALKER}:ro`,
+      "-v", `${out}:/out`,
+      "-e", `NAMES=${names.join(" ")}`,
+      "-e", `SH=${shell}`,
+      "-e", `TAG=${tag}`,
+      IMAGE, "sh", "-c", RUNNER,
+    ],
+    { encoding: "utf8", timeout: TIMEOUT, stdio: ["ignore", "inherit", "inherit"] },
+  );
 }
+
+const readOut = (out, name, tag) => {
+  const at = (ext) => {
+    try {
+      return readFileSync(`${out}/${name}.${tag}.${ext}`, "utf8");
+    } catch {
+      return "";
+    }
+  };
+  const status = Number.parseInt(at("status").trim(), 10);
+  // 124 is timeout(1)'s own exit, so a hang is reported as one rather than
+  // silently comparing two truncated outputs.
+  return { out: at("out"), err: at("err"), status, timedOut: status === 124 };
+};
 
 // Why a test failed, judged from the walker's own diagnostics rather than
 // guessed. "unimplemented" is what the walker says it does not do; anything
@@ -99,10 +135,20 @@ function classify(w) {
   return "divergence";
 }
 
+const out = mkdtempSync(join(tmpdir(), "bashconf-"));
+console.log(`${names.length} tests, both shells in ${IMAGE}`);
+for (const [shell, tag] of [[BASH, "bash"], [WALKER, "walker"]]) {
+  const r = sweep(shell, tag, out);
+  if (r.status !== 0 && r.error) {
+    console.error(`the ${tag} sweep did not finish: ${r.error.message}`);
+    process.exit(1);
+  }
+}
+
 const results = [];
 for (const name of names) {
-  const b = run(BASH, name);
-  const w = run(WALKER, name);
+  const b = readOut(out, name, "bash");
+  const w = readOut(out, name, "walker");
   const outSame = b.out === w.out;
   const errSame = b.err === w.err;
   const statusSame = b.status === w.status;
