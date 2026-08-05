@@ -22,13 +22,13 @@ mod report;
 mod scan;
 
 pub use construct::{Construct, Instead};
-pub use report::{Finding, Location, Report};
+pub use report::{Finding, Report};
 
 #[derive(Debug)]
 pub enum Refusal {
     /// Not bash syntax. The parser's answer, passed through unchanged.
     Syntax(ParseError),
-    /// Bash syntax the walker cannot execute, with every finding located.
+    /// Bash syntax the walker cannot execute, holding every finding.
     Unsupported(Report),
 }
 
@@ -46,21 +46,21 @@ pub fn inspect(source: &str) -> Result<Command, Refusal> {
             // pattern written `(select)` reads as command position and is the
             // one form that can. Drop those rather than guess.
             let found: Vec<_> =
-                found.into_iter().filter(|(c, _)| *c == Construct::PosixMode).collect();
+                found.into_iter().filter(|c| *c == Construct::PosixMode).collect();
             if found.is_empty() {
                 Ok(tree)
             } else {
-                Err(Refusal::Unsupported(Report::new(source, found)))
+                Err(Refusal::Unsupported(Report::new(found)))
             }
         }
         // The parser refused a construct this pass owns. It reports one and
         // stops; the scan has the rest of the script, so the reader still gets
-        // every finding and a location for each.
+        // every finding.
         Err(e @ ParseError::Unsupported(_)) => {
             if found.is_empty() {
                 Err(Refusal::Syntax(e))
             } else {
-                Err(Refusal::Unsupported(Report::new(source, found)))
+                Err(Refusal::Unsupported(Report::new(found)))
             }
         }
         Err(e) => Err(Refusal::Syntax(e)),

@@ -1403,9 +1403,9 @@ fn inspect_reports_every_refused_construct_and_executes_nothing() {
 
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty(), "nothing should have run, got {:?}", out.stdout);
-    assert!(stderr.contains("-c:2:5: error: set -o posix:"), "{stderr}");
-    assert!(stderr.contains("-c:3:1: error: select:"), "{stderr}");
-    assert!(stderr.contains("-c:4:1: error: coproc:"), "{stderr}");
+    assert!(stderr.contains("-c: error: set -o posix:"), "{stderr}");
+    assert!(stderr.contains("-c: error: select:"), "{stderr}");
+    assert!(stderr.contains("-c: error: coproc:"), "{stderr}");
     assert!(stderr.contains("3 constructs cannot be executed"), "{stderr}");
     assert!(stderr.contains("Nothing ran"), "{stderr}");
 }

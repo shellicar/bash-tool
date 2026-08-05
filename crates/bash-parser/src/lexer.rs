@@ -87,26 +87,6 @@ impl<'a> Lexer<'a> {
     pub fn take_bodies(&mut self) -> VecDeque<String> {
         std::mem::take(&mut self.bodies)
     }
-
-    /// The same stream as `next_token`, each token paired with the byte offset
-    /// it starts at. Blanks, comments and line continuations are skipped before
-    /// the offset is taken, so it is the token's own first byte. Static
-    /// inspection reports a location for what it refuses, and the lexer is the
-    /// only place that already knows where a token began.
-    pub fn next_token_at(&mut self) -> Result<(Token, usize), LexError> {
-        loop {
-            self.skip_blanks();
-            if self.peek() == Some(b'#') {
-                while !matches!(self.peek(), None | Some(b'\n')) {
-                    self.pos += 1;
-                }
-                continue;
-            }
-            let start = self.pos;
-            return Ok((self.next_token()?, start));
-        }
-    }
-
 }
 
 /// `((` opens arithmetic only if what sits between the outer parens could be
