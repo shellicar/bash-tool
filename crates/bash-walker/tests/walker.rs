@@ -1447,3 +1447,12 @@ fn case_modification_leaves_a_first_character_its_pattern_misses() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn a_quoted_brace_does_not_end_a_braced_expansion() {
+    let expected = "[}]\n";
+
+    let (actual, _) = run("unset x; echo [${x:-'}'}]");
+
+    assert_eq!(actual, expected);
+}

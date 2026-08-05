@@ -883,12 +883,43 @@ fn matched_paren(b: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// The `}` that closes the `${` at `open`. Counting depth alone ends the span
+/// on a quoted brace: `"${x:-'}'}"` closed at the one inside the quotes and
+/// left `'}` as text. The quote arms are the same ones `matched_paren` carries,
+/// and the pair have to keep agreeing: this is the third file the same scanner
+/// defect has appeared in.
 fn matched_brace(b: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0;
     let mut i = open;
     while i < b.len() {
         match b[i] {
             b'\\' => i += 1,
+            // `$'...'` escapes its own quote, so `\'` inside it is a literal
+            // and does not end the span.
+            b'$' if i + 1 < b.len() && b[i + 1] == b'\'' => {
+                i += 2;
+                while i < b.len() && b[i] != b'\'' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'\'' => {
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;
