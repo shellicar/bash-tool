@@ -1384,3 +1384,120 @@ fn ansi_c_quoting_survives_inside_a_command_substitution() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn declare_p_prints_the_value_the_way_bash_quotes_it() {
+    let expected = ("declare -- v=\"a \\\"b\\\" \\$c \\\\\\\\ \\`d\\`\"\ndeclare -- w=$'x\\ty'\n".to_string(), 0);
+
+    let actual = run("v='a \"b\" $c \\\\ `d`'; declare -p v; w=$'x\\ty'; declare -p w");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn an_integer_variable_evaluates_its_assignment_as_arithmetic() {
+    let expected = ("declare -i n=\"7\"\n7\n".to_string(), 0);
+
+    let actual = run("declare -i n; n=3+4; declare -p n; echo $n");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn case_attributes_transform_the_value_on_assignment() {
+    let expected = ("declare -l lower=\"abc\"\ndeclare -u upper=\"ABC\"\n".to_string(), 0);
+
+    let actual = run("declare -l lower=ABC; declare -u upper=abc; declare -p lower upper");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn readonly_keeps_the_value_it_was_given_and_refuses_a_later_declare() {
+    let (output, _) = run("readonly r=5; declare r=6; echo st=$?; declare -p r");
+
+    assert!(output.contains("r: readonly variable"), "{output}");
+    assert!(output.contains("st=1\n"), "{output}");
+    assert!(output.contains("declare -r r=\"5\"\n"), "{output}");
+}
+
+#[test]
+fn unset_refuses_a_readonly_variable() {
+    let (output, _) = run("readonly r=5; unset r; echo st=$?; echo r=$r");
+
+    assert!(output.contains("cannot unset: readonly variable"), "{output}");
+    assert!(output.contains("st=1\nr=5\n"), "{output}");
+}
+
+#[test]
+fn declare_without_a_value_leaves_the_name_unset_but_declared() {
+    let expected = ("[UNSET]\ndeclare -- y\n".to_string(), 0);
+
+    let actual = run("declare y; echo \"[${y-UNSET}]\"; declare -p y");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn declare_p_reports_a_name_nothing_declares() {
+    let (output, _) = run("declare -p nope; echo st=$?");
+
+    assert!(output.contains("nope: not found"), "{output}");
+    assert!(output.contains("st=1\n"), "{output}");
+}
+
+#[test]
+fn declare_inside_a_function_is_local_unless_it_says_global() {
+    let expected = ("in=1\nout=[]\ngv=2\n".to_string(), 0);
+
+    let actual = run(
+        "f() { declare inner=1; echo in=$inner; }\nf\necho out=[$inner]\ng() { declare -g gv=2; }\ng\necho gv=$gv",
+    );
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_valueless_local_shadows_the_global_as_unset() {
+    let expected = ("[unset]\nin\nout\n".to_string(), 0);
+
+    let actual = run("f() { local x; echo \"[${x-unset}]\"; x=in; echo $x; }; x=out; f; echo $x");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_local_does_not_inherit_the_globals_integer_attribute() {
+    let expected = ("[2+3]\ndeclare -- g=\"2+3\"\n".to_string(), 0);
+
+    let actual = run("declare -i g=1; f() { local g=2+3; echo \"[$g]\"; declare -p g; }; f");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn readonly_p_lists_only_what_is_readonly() {
+    let expected = ("declare -r y=\"2\"\n".to_string(), 0);
+
+    let actual = run("x=1; readonly y=2; readonly -p");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn an_exported_variable_declares_itself_exported() {
+    let expected = ("declare -x e=\"7\"\ndeclare -- e=\"7\"\n".to_string(), 0);
+
+    let actual = run("export e=7; declare -p e; export -n e; declare -p e");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn declaring_an_exported_name_with_no_value_keeps_it_out_of_the_environment() {
+    let expected = ("declare -x q\n[UNSET]\nnone\n".to_string(), 0);
+
+    let actual = run("export q; declare -p q; echo \"[${q-UNSET}]\"; env | grep '^q=' || echo none");
+
+    assert_eq!(actual, expected);
+}

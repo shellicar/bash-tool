@@ -25,6 +25,107 @@ pub struct Var {
     pub exported: bool,
 }
 
+/// What `declare` records about a variable beyond its value.
+///
+/// A variable can carry attributes with no value at all (`declare -i n`
+/// leaves `n` unset but integer), and a `local` scope can carry its own,
+/// so attributes are stored in the same map as the variables themselves,
+/// under a key beginning with U+0001 — a byte no shell identifier can
+/// contain. That is what keeps them scoped correctly for free: the walker
+/// pushes and pops those maps around a function call, and anything living
+/// beside the variables travels with them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Attrs {
+    pub integer: bool,
+    pub readonly: bool,
+    pub trace: bool,
+    pub exported: bool,
+    pub lower: bool,
+    pub upper: bool,
+}
+
+impl Attrs {
+    /// The letters in the order `declare -p` prints them, which is bash's
+    /// own attribute table order and not alphabetical.
+    pub fn letters(&self) -> String {
+        let mut s = String::new();
+        for (on, c) in [
+            (self.integer, 'i'),
+            (self.readonly, 'r'),
+            (self.trace, 't'),
+            (self.exported, 'x'),
+            (self.lower, 'l'),
+            (self.upper, 'u'),
+        ] {
+            if on {
+                s.push(c);
+            }
+        }
+        s
+    }
+
+    pub fn from_letters(s: &str) -> Self {
+        let mut a = Self::default();
+        for c in s.chars() {
+            a.set(c, true);
+        }
+        a
+    }
+
+    /// One `declare` option letter. `-l` and `-u` are exclusive: bash drops
+    /// the other rather than holding both.
+    pub fn set(&mut self, letter: char, on: bool) -> bool {
+        match letter {
+            'i' => self.integer = on,
+            'r' => self.readonly = on,
+            't' => self.trace = on,
+            'x' => self.exported = on,
+            'l' => {
+                self.lower = on;
+                if on {
+                    self.upper = false;
+                }
+            }
+            'u' => {
+                self.upper = on;
+                if on {
+                    self.lower = false;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Why an assignment did not happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignError {
+    Readonly,
+    /// The variable is `-i` and the value is not an arithmetic expression;
+    /// carries bash's own message for the expression.
+    Arith(String),
+}
+
+fn attr_key(name: &str) -> String {
+    format!("\u{1}{name}")
+}
+
+fn is_attr_key(key: &str) -> bool {
+    key.starts_with('\u{1}')
+}
+
+fn write_attrs(map: &mut HashMap<String, Var>, name: &str, key: &str, attrs: Attrs) {
+    if let Some(v) = map.get_mut(name) {
+        v.exported = attrs.exported;
+    }
+    map.insert(key.to_string(), Var { value: attrs.letters(), exported: false });
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedState {
     pub cwd: Option<PathBuf>,
@@ -153,62 +254,221 @@ impl Default for ShellState {
 
 impl ShellState {
     /// Variable lookup: innermost local scope first, then shell vars (which
-    /// include the environment snapshot taken at birth).
+    /// include the environment snapshot taken at birth). A scope that
+    /// declares the name without a value (`local x`) shadows the outer one
+    /// and reads as unset, exactly as under bash.
     pub fn get_var(&self, name: &str) -> Option<String> {
+        let key = attr_key(name);
         for scope in self.locals.iter().rev() {
             if let Some(v) = scope.get(name) {
                 return Some(v.value.clone());
+            }
+            if scope.contains_key(&key) {
+                return None;
             }
         }
         self.vars.get(name).map(|v| v.value.clone())
     }
 
-    /// Assignment: an existing `local` in any active scope wins, otherwise
-    /// the shell var (keeping its exported flag).
-    pub fn set_var(&mut self, name: &str, value: String) {
-        for scope in self.locals.iter_mut().rev() {
-            if let Some(v) = scope.get_mut(name) {
-                v.value = value;
+    /// The attributes in force for `name`, taken from the scope that
+    /// declares it. An exported value carries `-x` whether or not anything
+    /// ever declared it, which is how the inherited environment prints.
+    pub fn get_attrs(&self, name: &str) -> Attrs {
+        let key = attr_key(name);
+        for scope in self.locals.iter().rev() {
+            let declared = scope.get(&key);
+            let held = scope.get(name);
+            if declared.is_none() && held.is_none() {
+                continue;
+            }
+            let mut a = declared.map(|v| Attrs::from_letters(&v.value)).unwrap_or_default();
+            if held.is_some_and(|v| v.exported) {
+                a.exported = true;
+            }
+            return a;
+        }
+        let mut a = self
+            .vars
+            .get(&key)
+            .map(|v| Attrs::from_letters(&v.value))
+            .unwrap_or_default();
+        if self.vars.get(name).is_some_and(|v| v.exported) {
+            a.exported = true;
+        }
+        a
+    }
+
+    /// Whether anything here declares the name: a value, or attributes
+    /// recorded before any value arrived (`declare -i n`).
+    pub fn is_declared(&self, name: &str) -> bool {
+        let key = attr_key(name);
+        for scope in self.locals.iter().rev() {
+            if scope.contains_key(name) || scope.contains_key(&key) {
+                return true;
+            }
+        }
+        self.vars.contains_key(name) || self.vars.contains_key(&key)
+    }
+
+    /// The attributes the current scope holds for `name`, if that scope is
+    /// the one that declares it. A `local` starts from these rather than
+    /// from whatever an outer scope says.
+    pub fn current_scope_attrs(&self, name: &str) -> Option<Attrs> {
+        let scope = self.locals.last()?;
+        let key = attr_key(name);
+        if !scope.contains_key(name) && !scope.contains_key(&key) {
+            return None;
+        }
+        let mut a = scope.get(&key).map(|v| Attrs::from_letters(&v.value)).unwrap_or_default();
+        if scope.get(name).is_some_and(|v| v.exported) {
+            a.exported = true;
+        }
+        Some(a)
+    }
+
+    /// Records attributes against the scope that already declares the name,
+    /// or globally. `local`-style declaration goes through
+    /// `declare_local_attrs` instead, which always uses the current scope.
+    pub fn set_attrs(&mut self, name: &str, attrs: Attrs) {
+        let key = attr_key(name);
+        for i in (0..self.locals.len()).rev() {
+            if self.locals[i].contains_key(name) || self.locals[i].contains_key(&key) {
+                write_attrs(&mut self.locals[i], name, &key, attrs);
                 return;
             }
         }
-        let exported = self.vars.get(name).is_some_and(|v| v.exported);
-        self.vars.insert(name.to_string(), Var { value, exported });
+        let mut globals = std::mem::take(&mut self.vars);
+        write_attrs(&mut globals, name, &key, attrs);
+        self.vars = globals;
+    }
+
+    /// `declare`/`local` inside a function: the attributes, and the name
+    /// itself, belong to the current scope even when an outer one has the
+    /// same name.
+    pub fn declare_local_attrs(&mut self, name: &str, attrs: Attrs) {
+        let key = attr_key(name);
+        if let Some(scope) = self.locals.last_mut() {
+            write_attrs(scope, name, &key, attrs);
+        } else {
+            self.set_attrs(name, attrs);
+        }
+    }
+
+    /// Assignment, with the variable's attributes applied: `-i` evaluates
+    /// the value as arithmetic, `-l`/`-u` change its case, and `-r` refuses
+    /// the write outright.
+    pub fn assign(&mut self, name: &str, value: String) -> Result<(), AssignError> {
+        let attrs = self.get_attrs(name);
+        if attrs.readonly {
+            return Err(AssignError::Readonly);
+        }
+        let value = self.apply_attrs(attrs, value)?;
+        self.store(name, value, attrs.exported);
+        Ok(())
+    }
+
+    /// The infallible form every expansion site uses. A refused write is a
+    /// no-op here; the builtins that owe the caller a message use `assign`.
+    pub fn set_var(&mut self, name: &str, value: String) {
+        let _ = self.assign(name, value);
+    }
+
+    fn apply_attrs(&mut self, attrs: Attrs, value: String) -> Result<String, AssignError> {
+        if attrs.integer {
+            if value.trim().is_empty() {
+                return Ok("0".to_string());
+            }
+            let n = crate::arith::eval(&value, self).map_err(|e| AssignError::Arith(e.0))?;
+            return Ok(n.to_string());
+        }
+        if attrs.lower {
+            return Ok(value.to_lowercase());
+        }
+        if attrs.upper {
+            return Ok(value.to_uppercase());
+        }
+        Ok(value)
+    }
+
+    /// Where a value lands: an existing `local` in any active scope wins,
+    /// then a scope that declared the name without a value, then the shell
+    /// vars (keeping whatever export flag was already there).
+    fn store(&mut self, name: &str, value: String, exported: bool) {
+        let key = attr_key(name);
+        for scope in self.locals.iter_mut().rev() {
+            if let Some(v) = scope.get_mut(name) {
+                v.value = value;
+                v.exported |= exported;
+                return;
+            }
+            if scope.contains_key(&key) {
+                scope.insert(name.to_string(), Var { value, exported });
+                return;
+            }
+        }
+        let was = self.vars.get(name).is_some_and(|v| v.exported);
+        self.vars.insert(name.to_string(), Var { value, exported: was || exported });
     }
 
     pub fn export_var(&mut self, name: &str, value: Option<String>) {
-        let value = value
-            .or_else(|| self.get_var(name))
-            .unwrap_or_default();
-        // Marking a local exported must not reach the global of the same name.
-        // Writing straight to `vars` meant a function exporting its own local
-        // overwrote the caller's variable, and the overwrite outlived the call.
-        for scope in self.locals.iter_mut().rev() {
-            if let Some(v) = scope.get_mut(name) {
-                v.value = value;
-                v.exported = true;
-                return;
-            }
+        let mut attrs = self.get_attrs(name);
+        attrs.exported = true;
+        self.set_attrs(name, attrs);
+        if let Some(v) = value {
+            let _ = self.assign(name, v);
         }
-        self.vars.insert(name.to_string(), Var { value, exported: true });
     }
 
-    pub fn unset_var(&mut self, name: &str) {
+    pub fn unset_var(&mut self, name: &str) -> Result<(), AssignError> {
+        if self.get_attrs(name).readonly {
+            return Err(AssignError::Readonly);
+        }
+        let key = attr_key(name);
         for scope in self.locals.iter_mut().rev() {
-            if scope.remove(name).is_some() {
-                return;
+            let had = scope.remove(name).is_some();
+            let had_attrs = scope.remove(&key).is_some();
+            if had || had_attrs {
+                return Ok(());
             }
         }
         self.vars.remove(name);
+        self.vars.remove(&key);
+        Ok(())
     }
 
+    /// A new variable in the current scope. Only the export attribute is
+    /// inherited from the variable it shadows: bash's `local` starts clean
+    /// otherwise, so a global `-i` does not make the local arithmetic.
     pub fn declare_local(&mut self, name: &str, value: Option<String>) {
-        if let Some(scope) = self.locals.last_mut() {
-            scope.insert(
-                name.to_string(),
-                Var { value: value.unwrap_or_default(), exported: false },
-            );
+        if self.locals.is_empty() {
+            return;
         }
+        let exported = self.get_attrs(name).exported;
+        self.declare_local_attrs(name, Attrs { exported, ..Attrs::default() });
+        if let Some(v) = value {
+            let _ = self.assign(name, v);
+        }
+    }
+
+    /// Every variable name visible here, innermost scope winning, in the
+    /// sorted order `declare -p` prints.
+    pub fn visible_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = self
+            .vars
+            .keys()
+            .chain(self.locals.iter().flat_map(|s| s.keys()))
+            .filter(|k| !is_attr_key(k))
+            .cloned()
+            .collect();
+        for scope in &self.locals {
+            for k in scope.keys().filter(|k| is_attr_key(k)) {
+                names.insert(k[1..].to_string());
+            }
+        }
+        for k in self.vars.keys().filter(|k| is_attr_key(k)) {
+            names.insert(k[1..].to_string());
+        }
+        names.into_iter().collect()
     }
 
     /// A relative path resolves against the shell's cwd; absolute passes
@@ -234,7 +494,7 @@ impl ShellState {
     pub fn child_env(&self) -> Vec<(String, String)> {
         self.vars
             .iter()
-            .filter(|(_, v)| v.exported)
+            .filter(|(k, v)| v.exported && !is_attr_key(k))
             .map(|(k, v)| (k.clone(), v.value.clone()))
             .collect()
     }

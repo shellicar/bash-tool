@@ -7,16 +7,17 @@
 
 use std::io::Read;
 
+use crate::state::{AssignError, Attrs};
 use crate::walk::{Ctx, Exec, Flow};
 
 const NATIVE: &[&str] = &[
     "cd", "pwd", "export", "unset", "local", "exit", "return", "break", "continue", "shift",
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
-    "echo", "printf", "exec", "umask", "builtin",
+    "echo", "printf", "exec", "umask", "builtin", "declare", "typeset", "readonly",
 ];
 
 const UNSUPPORTED: &[&str] = &[
-    "declare", "typeset", "readonly", "alias", "unalias", "trap", "getopts", "ulimit",
+    "alias", "unalias", "trap", "getopts", "ulimit",
     "jobs", "fg", "bg", "hash", "type", "help", "history", "disown", "suspend", "times",
     "caller", "enable", "pushd", "popd", "dirs", "mapfile", "readarray",
 ];
@@ -40,41 +41,14 @@ pub fn run(
             ctx.write_out(&format!("{}\n", ex.state.cwd.display()));
             Ok(0)
         }
-        "export" => {
-            for a in args {
-                match a.split_once('=') {
-                    Some((k, v)) => ex.state.export_var(k, Some(v.to_string())),
-                    None => ex.state.export_var(a, None),
-                }
-            }
-            Ok(0)
-        }
-        "unset" => {
-            let mut names = args.iter();
-            for a in names.by_ref() {
-                if a == "-f" {
-                    continue;
-                }
-                if a == "-v" {
-                    continue;
-                }
-                ex.state.funcs.remove(a);
-                ex.state.unset_var(a);
-            }
-            Ok(0)
-        }
+        "export" | "declare" | "typeset" | "readonly" => declare(ex, ctx, name, args),
+        "unset" => unset(ex, ctx, args),
         "local" => {
             if ex.shared.func_depth == 0 {
                 ctx.write_err("bash-walker: local: can only be used in a function\n");
                 return Ok(1);
             }
-            for a in args {
-                match a.split_once('=') {
-                    Some((k, v)) => ex.state.declare_local(k, Some(v.to_string())),
-                    None => ex.state.declare_local(a, None),
-                }
-            }
-            Ok(0)
+            declare(ex, ctx, "local", args)
         }
         "exit" => Err(Flow::Exit(parse_status(args.first()))),
         "return" => {
@@ -767,6 +741,338 @@ fn cd(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
             Ok(1)
         }
     }
+}
+
+/// `declare`, and the four builtins bash implements with the same code:
+/// `typeset`, `readonly`, `export` and `local`. They differ in the
+/// attributes they imply and in whether a name lands in the current scope
+/// or the global one.
+fn declare(ex: &mut Exec, ctx: &Ctx, verb: &str, args: &[String]) -> Result<i32, Flow> {
+    let mut on = Attrs::default();
+    let mut off = Attrs::default();
+    let mut print = false;
+    let mut global = false;
+    let mut functions = false;
+    let mut names_only = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        let plus = a.starts_with('+');
+        if !(plus || a.starts_with('-')) || a.len() < 2 {
+            break;
+        }
+        for c in a[1..].chars() {
+            match c {
+                'p' => print = true,
+                'g' => global = true,
+                'f' => functions = true,
+                'F' => {
+                    functions = true;
+                    names_only = true;
+                }
+                'n' if verb == "export" => off.exported = true,
+                'a' | 'A' => {
+                    return Err(Flow::Fatal(format!(
+                        "{verb} -{c}: arrays are not supported by bash-walker"
+                    )))
+                }
+                'n' => {
+                    return Err(Flow::Fatal(format!(
+                        "{verb} -n: namerefs are not supported by bash-walker"
+                    )))
+                }
+                other => {
+                    let target = if plus { &mut off } else { &mut on };
+                    if !target.set(other, true) {
+                        ctx.write_err(&format!(
+                            "bash-walker: {verb}: -{other}: invalid option\n{verb}: usage: {verb} [-fFgilprtux] [name[=value] ...]\n"
+                        ));
+                        return Ok(2);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    match verb {
+        "readonly" => on.readonly = true,
+        "export" if !off.exported => on.exported = true,
+        _ => {}
+    }
+    let names = &args[i..];
+
+    if names.is_empty() {
+        return list_declarations(ex, ctx, verb, on, print, functions, names_only);
+    }
+
+    // `declare` inside a function declares locally unless told otherwise,
+    // which is what makes `declare x` in a function shadow the global.
+    let scope_is_local = verb == "local" || (ex.shared.func_depth > 0 && !global);
+    let mut status = 0;
+    for arg in names {
+        let (name, value) = match arg.split_once('=') {
+            Some((n, v)) => (n, Some(v.to_string())),
+            None => (arg.as_str(), None),
+        };
+        if functions {
+            status |= print_function(ex, ctx, verb, name, names_only);
+            continue;
+        }
+        if !is_identifier(name) {
+            ctx.write_err(&format!(
+                "bash-walker: {verb}: `{arg}': not a valid identifier\n"
+            ));
+            status = 1;
+            continue;
+        }
+        if print && on.is_empty() && off.is_empty() && value.is_none() {
+            match declaration_line(ex, name) {
+                Some(line) => ctx.write_out(&line),
+                None => {
+                    ctx.write_err(&format!("bash-walker: {verb}: {name}: not found\n"));
+                    status = 1;
+                }
+            }
+            continue;
+        }
+        // A new local starts from nothing but the export attribute: a
+        // global `-i` must not make the local arithmetic. Readonly is still
+        // read from the variable being shadowed, which is what refuses
+        // `local x` over a readonly global.
+        let effective = ex.state.get_attrs(name);
+        let current = if scope_is_local {
+            ex.state
+                .current_scope_attrs(name)
+                .unwrap_or(Attrs { exported: effective.exported, ..Attrs::default() })
+        } else {
+            effective
+        };
+        if effective.readonly && (value.is_some() || !off.is_empty()) {
+            ctx.write_err(&format!("bash-walker: {verb}: {name}: readonly variable\n"));
+            status = 1;
+            continue;
+        }
+        let mut attrs = current;
+        for c in on.letters().chars() {
+            attrs.set(c, true);
+        }
+        for c in off.letters().chars() {
+            attrs.set(c, false);
+        }
+        // The value goes in before `-r` takes effect: `readonly x=1` sets
+        // the variable it is making readonly, it does not refuse itself.
+        let landing = Attrs { readonly: false, ..attrs };
+        if scope_is_local {
+            ex.state.declare_local_attrs(name, landing);
+        } else {
+            ex.state.set_attrs(name, landing);
+        }
+        let mut assigned = Ok(());
+        if let Some(v) = value {
+            assigned = ex.state.assign(name, v);
+        }
+        if attrs.readonly {
+            if scope_is_local {
+                ex.state.declare_local_attrs(name, attrs);
+            } else {
+                ex.state.set_attrs(name, attrs);
+            }
+        }
+        {
+            match assigned {
+                Ok(()) => {}
+                Err(AssignError::Readonly) => {
+                    ctx.write_err(&format!("bash-walker: {verb}: {name}: readonly variable\n"));
+                    status = 1;
+                }
+                Err(AssignError::Arith(msg)) => {
+                    ctx.write_err(&format!("bash-walker: {verb}: {msg}\n"));
+                    status = 1;
+                }
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// The no-name forms: every variable carrying the attributes asked for, in
+/// the order and shape bash prints them.
+fn list_declarations(
+    ex: &mut Exec,
+    ctx: &Ctx,
+    verb: &str,
+    filter: Attrs,
+    print: bool,
+    functions: bool,
+    names_only: bool,
+) -> Result<i32, Flow> {
+    if functions {
+        if !names_only {
+            return Err(Flow::Fatal(
+                "declare -f: printing a function definition is not supported by bash-walker".into(),
+            ));
+        }
+        let mut names: Vec<&String> = ex.state.funcs.keys().collect();
+        names.sort();
+        let mut out = String::new();
+        for n in names {
+            out.push_str(&format!("{n}\n"));
+        }
+        ctx.write_out(&out);
+        return Ok(0);
+    }
+    // Bare `declare` prints name=value and the function definitions after
+    // it; every other form prints the `declare -X name="value"` shape.
+    let bare = !print && filter.is_empty();
+    if bare && !ex.state.funcs.is_empty() {
+        return Err(Flow::Fatal(format!(
+            "{verb}: printing a function definition is not supported by bash-walker"
+        )));
+    }
+    let mut out = String::new();
+    for name in ex.state.visible_names() {
+        let attrs = ex.state.get_attrs(&name);
+        if !attrs_include(attrs, filter) {
+            continue;
+        }
+        let value = ex.state.get_var(&name);
+        if bare {
+            if let Some(v) = value {
+                out.push_str(&format!("{name}={v}\n"));
+            }
+        } else {
+            out.push_str(&format_declaration(&name, attrs, value.as_deref()));
+        }
+    }
+    ctx.write_out(&out);
+    Ok(0)
+}
+
+fn print_function(ex: &Exec, ctx: &Ctx, verb: &str, name: &str, names_only: bool) -> i32 {
+    if !ex.state.funcs.contains_key(name) {
+        ctx.write_err(&format!("bash-walker: {verb}: {name}: not found\n"));
+        return 1;
+    }
+    if names_only {
+        ctx.write_out(&format!("{name}\n"));
+        return 0;
+    }
+    ctx.write_err(
+        "bash-walker: declare -f: printing a function definition is not supported by bash-walker\n",
+    );
+    1
+}
+
+/// One `declare -p` line, or None when nothing declares the name.
+fn declaration_line(ex: &Exec, name: &str) -> Option<String> {
+    let attrs = ex.state.get_attrs(name);
+    let value = ex.state.get_var(name);
+    if value.is_none() && attrs.is_empty() && !ex.state.is_declared(name) {
+        return None;
+    }
+    Some(format_declaration(name, attrs, value.as_deref()))
+}
+
+fn format_declaration(name: &str, attrs: Attrs, value: Option<&str>) -> String {
+    let letters = attrs.letters();
+    let flags = if letters.is_empty() { "--".to_string() } else { format!("-{letters}") };
+    match value {
+        Some(v) => format!("declare {flags} {name}={}\n", quote_value(v)),
+        None => format!("declare {flags} {name}\n"),
+    }
+}
+
+/// bash quotes a value so it reads back as itself: double quotes normally,
+/// and `$'...'` as soon as a control character is in there.
+fn quote_value(v: &str) -> String {
+    if v.chars().any(|c| (c as u32) < 0x20 || c == '\x7f') {
+        let mut q = String::from("$'");
+        for c in v.chars() {
+            match c {
+                '\n' => q.push_str("\\n"),
+                '\t' => q.push_str("\\t"),
+                '\r' => q.push_str("\\r"),
+                '\'' => q.push_str("\\'"),
+                '\\' => q.push_str("\\\\"),
+                c if (c as u32) < 0x20 || c == '\x7f' => {
+                    q.push_str(&format!("\\{:03o}", c as u32))
+                }
+                c => q.push(c),
+            }
+        }
+        q.push('\'');
+        return q;
+    }
+    let mut q = String::from("\"");
+    for c in v.chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            q.push('\\');
+        }
+        q.push(c);
+    }
+    q.push('"');
+    q
+}
+
+fn attrs_include(a: Attrs, filter: Attrs) -> bool {
+    filter.letters().chars().all(|c| a.letters().contains(c))
+}
+
+fn is_identifier(name: &str) -> bool {
+    let mut cs = name.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `unset [-fv] name...`. With neither flag bash unsets the variable, and
+/// only falls back to the function when no variable of that name exists.
+fn unset(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    let mut vars_only = false;
+    let mut funcs_only = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-v" => vars_only = true,
+            "-f" => funcs_only = true,
+            "--" => {
+                i += 1;
+                break;
+            }
+            a if a.starts_with('-') && a.len() > 1 => {
+                ctx.write_err(&format!(
+                    "bash-walker: unset: {a}: invalid option\nunset: usage: unset [-f] [-v] [name ...]\n"
+                ));
+                return Ok(2);
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    let mut status = 0;
+    for name in &args[i..] {
+        if funcs_only {
+            ex.state.funcs.remove(name);
+            continue;
+        }
+        if !vars_only && !ex.state.is_declared(name) && ex.state.funcs.contains_key(name) {
+            ex.state.funcs.remove(name);
+            continue;
+        }
+        if ex.state.unset_var(name).is_err() {
+            ctx.write_err(&format!(
+                "bash-walker: unset: {name}: cannot unset: readonly variable\n"
+            ));
+            status = 1;
+        }
+    }
+    Ok(status)
 }
 
 /// `umask [-S] [mode]` — query or set the file-creation mask. No arg
