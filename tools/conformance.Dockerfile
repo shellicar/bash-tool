@@ -56,4 +56,12 @@ RUN cc -o tests/recho support/recho.c \
  && cc -o tests/zecho support/zecho.c \
  && cc -o tests/printenv support/printenv.c
 
+# Bash's own tests refuse to run as root: several call the suite off with "the
+# test suite should not be run as root". That hits both shells equally so the
+# comparison stays fair, but those files then measure almost nothing. The tests
+# write into their own directory as well as TMPDIR, so the tree is handed over
+# with them.
+RUN useradd --create-home --uid 1000 tester && chown -R tester /src
+USER tester
+
 WORKDIR /src/tests
