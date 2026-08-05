@@ -30,6 +30,11 @@ pub enum Token {
     And,      // &&
     Or,       // ||
     Pipe,     // |
+    /// `|&` — bash's shorthand for `2>&1 |`. Kept as its own token because
+    /// the redirect it stands for lands on the LEFT stage, after whatever
+    /// redirects that stage already carries (`echo a 2>/dev/null |& cat`
+    /// prints back as `echo a 2> /dev/null 2>&1 | cat`).
+    PipeAmp,
     Semi,     // ;
     DSemi,    // ;;   (case arm terminator)
     SemiAmp,  // ;&   (case fallthrough)
@@ -42,6 +47,7 @@ pub enum Token {
     DLessDash, // <<-
     DLessLess, // <<<
     GreatAmp,  // >&
+    GreatPipe, // >|
     LessAmp,   // <&
     AmpGreat,  // &>
     AmpDGreat, // &>>
@@ -368,6 +374,13 @@ impl<'a> Lexer<'a> {
                 self.pos += 2;
                 return Ok(chunks);
             }
+            // Inside `[[ ]]` bash reads `(` and `)` as tokens in their own
+            // right, so `[[ (-n a) ]]` and `[[ (a && b) || (c) ]]` need no
+            // spaces around them. Two things stay part of the word: an
+            // extglob head (`@(a)b`, always live in `[[ ]]` whatever shopt
+            // says), and the operand after `=~`, which bash reads as a regex
+            // where parens are the regex's own.
+            let regex = chunks.last().is_some_and(|c| c == "=~");
             let mut chunk = Vec::<u8>::new();
             loop {
                 match self.peek() {
@@ -397,6 +410,24 @@ impl<'a> Lexer<'a> {
                         chunk.extend_from_slice(
                             self.scan_matched(b'{', b'}', "parameter expansion ${...}")?.as_bytes(),
                         );
+                    }
+                    Some(b'(') if !regex => {
+                        if matches!(chunk.last(), Some(b'?' | b'*' | b'+' | b'@' | b'!')) {
+                            chunk.extend_from_slice(
+                                self.scan_matched(b'(', b')', "extglob pattern")?.as_bytes(),
+                            );
+                        } else {
+                            if chunk.is_empty() {
+                                chunk.push(self.bump().unwrap());
+                            }
+                            break;
+                        }
+                    }
+                    Some(b')') if !regex => {
+                        if chunk.is_empty() {
+                            chunk.push(self.bump().unwrap());
+                        }
+                        break;
                     }
                     Some(b'\\') => {
                         chunk.push(self.bump().unwrap());
@@ -494,6 +525,10 @@ impl<'a> Lexer<'a> {
                 self.pos += 2;
                 Ok(Token::Or)
             }
+            Some(b'|') if self.peek_at(1) == Some(b'&') => {
+                self.pos += 2;
+                Ok(Token::PipeAmp)
+            }
             Some(b'|') => {
                 self.pos += 1;
                 Ok(Token::Pipe)
@@ -569,6 +604,10 @@ impl<'a> Lexer<'a> {
             Some(b'>') if self.peek_at(1) == Some(b'&') => {
                 self.pos += 2;
                 Ok(Token::GreatAmp)
+            }
+            Some(b'>') if self.peek_at(1) == Some(b'|') => {
+                self.pos += 2;
+                Ok(Token::GreatPipe)
             }
             Some(b'>') if self.peek_at(1) == Some(b'(') => {
                 let (text, quoted) = self.scan_word()?;

@@ -87,6 +87,18 @@ impl<'a> Parser<'a> {
     /// `simple_list simple_list_terminator | ...`, parse.y:433 onward,
     /// scoped to this grammar).
     pub fn parse_program(&mut self) -> Result<Command, ParseError> {
+        // A script of nothing but blank lines and comments is a valid bash
+        // program that runs nothing. An empty *compound_list* is not, so the
+        // emptiness is allowed here and never in `parse_command_list`.
+        self.skip_newlines()?;
+        if matches!(self.peek()?, Token::Eof) {
+            return Ok(Command::Simple(SimpleCommand {
+                assignments: Vec::new(),
+                program: None,
+                args: Vec::new(),
+                redirects: Vec::new(),
+            }));
+        }
         self.parse_command_list(|t| matches!(t, Token::Eof))
     }
 
@@ -173,25 +185,59 @@ impl<'a> Parser<'a> {
         match self.peek()? {
             Token::Word(w, _) if w == "!" => {
                 self.advance()?;
-                return Ok(Command::Invert(Box::new(self.parse_pipeline()?)));
+                let inner = self.parse_pipeline_or_nothing()?;
+                return Ok(Command::Invert(Box::new(inner)));
             }
             Token::Word(w, _) if w == "time" => {
                 self.advance()?;
                 if matches!(self.peek()?, Token::Word(f, _) if f == "-p") {
                     self.advance()?; // POSIX-format flag; not represented in the AST
                 }
-                return Ok(Command::Time(Box::new(self.parse_pipeline()?)));
+                if matches!(self.peek()?, Token::Word(f, _) if f == "--") {
+                    self.advance()?;
+                }
+                let inner = self.parse_pipeline_or_nothing()?;
+                return Ok(Command::Time(Box::new(inner)));
             }
             _ => {}
         }
         let mut left = self.parse_command()?;
-        while matches!(self.peek()?, Token::Pipe) {
+        while matches!(self.peek()?, Token::Pipe | Token::PipeAmp) {
+            if matches!(self.peek()?, Token::PipeAmp) {
+                left = merge_stderr_into_stdout(left);
+            }
             self.advance()?;
             self.skip_newlines()?;
             let right = self.parse_command()?;
             left = Command::Connection(Connection { left: Box::new(left), right: Box::new(right), connector: Connector::Pipe });
         }
         Ok(left)
+    }
+
+    /// `!` and `time` both take an optionally EMPTY pipeline: bash runs `!`
+    /// on its own (status 1), `! !` (status 0) and a bare `time` (which
+    /// times nothing and prints the format).
+    fn parse_pipeline_or_nothing(&mut self) -> Result<Command, ParseError> {
+        if self.at_command_end()? {
+            return Ok(Command::Simple(SimpleCommand {
+                assignments: Vec::new(),
+                program: None,
+                args: Vec::new(),
+                redirects: Vec::new(),
+            }));
+        }
+        self.parse_pipeline()
+    }
+
+    fn at_command_end(&mut self) -> Result<bool, ParseError> {
+        Ok(match self.peek()? {
+            Token::Semi | Token::Newline | Token::Eof | Token::Amp | Token::RParen
+            | Token::DSemi | Token::SemiAmp | Token::DSemiAmp | Token::And | Token::Or => true,
+            Token::Word(w, _) => {
+                matches!(w.as_str(), "}" | "fi" | "done" | "esac" | "then" | "else" | "elif")
+            }
+            _ => false,
+        })
     }
 
     fn parse_command(&mut self) -> Result<Command, ParseError> {
@@ -255,8 +301,8 @@ impl<'a> Parser<'a> {
         loop {
             match self.peek()? {
                 Token::Great | Token::DGreat | Token::Less | Token::DLess | Token::DLessDash
-                | Token::DLessLess | Token::GreatAmp | Token::LessAmp | Token::AmpGreat
-                | Token::AmpDGreat => redirects.push(self.parse_redirect(None)?),
+                | Token::DLessLess | Token::GreatAmp | Token::GreatPipe | Token::LessAmp
+                | Token::AmpGreat | Token::AmpDGreat => redirects.push(self.parse_redirect(None)?),
                 Token::Fd(n) => {
                     let n = *n;
                     self.advance()?;
@@ -297,7 +343,19 @@ impl<'a> Parser<'a> {
         if matches!(self.peek()?, Token::Arith(_)) {
             let Token::Arith(expr) = self.advance()? else { unreachable!() };
             self.consume_list_separators()?;
-            let body = self.parse_do_done()?;
+            // `for ((...)) { list; }` is a body form bash accepts only here:
+            // `for x in a b { ...; }` and `while c { ...; }` are both syntax
+            // errors. bash prints it back as the ordinary do/done loop.
+            let body = if matches!(self.peek()?, Token::Word(w, _) if w == "{") {
+                self.advance()?;
+                let inner =
+                    self.parse_command_list(|t| matches!(t, Token::Word(w, _) if w == "}"))?;
+                self.skip_newlines()?;
+                self.expect_word("}")?;
+                Box::new(inner)
+            } else {
+                self.parse_do_done()?
+            };
             return Ok(Command::ArithFor { expr, body });
         }
         let var = match self.advance()? {
@@ -460,9 +518,13 @@ impl<'a> Parser<'a> {
                         // Only checkable after the name is consumed (single-
                         // token lookahead), which is why this lives here and
                         // not in parse_command.
+                        // The name is any word bash did not already lex as an
+                        // assignment: `foo-a`, `foo.bar`, `1foo` and `a/b` are
+                        // all legal function names, so no identifier rule
+                        // applies here (only `a=b() { :; }` is a syntax error,
+                        // and the assignment branch above has taken that).
                         if assignments.is_empty()
                             && redirects.is_empty()
-                            && is_name(&w)
                             && matches!(self.peek()?, Token::LParen)
                         {
                             self.advance()?;
@@ -477,8 +539,8 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Token::Great | Token::DGreat | Token::Less | Token::DLess | Token::DLessDash
-                | Token::DLessLess | Token::GreatAmp | Token::LessAmp | Token::AmpGreat
-                | Token::AmpDGreat => {
+                | Token::DLessLess | Token::GreatAmp | Token::GreatPipe | Token::LessAmp
+                | Token::AmpGreat | Token::AmpDGreat => {
                     redirects.push(self.parse_redirect(None)?);
                 }
                 Token::Fd(n) => {
@@ -499,6 +561,10 @@ impl<'a> Parser<'a> {
     fn parse_redirect(&mut self, fd: Option<u32>) -> Result<Redirect, ParseError> {
         let op = match self.advance()? {
             Token::Great => RedirectOp::Out,
+            // `>|` is `>` with noclobber overridden, and the two differ only
+            // when noclobber is on. `set -C`/`set -o noclobber` is refused
+            // outright, so no script this executes can tell them apart.
+            Token::GreatPipe => RedirectOp::Out,
             Token::DGreat => RedirectOp::Append,
             Token::Less => RedirectOp::In,
             Token::DLess => RedirectOp::Heredoc,
@@ -551,6 +617,29 @@ fn split_assignment(w: &str) -> Option<(String, String, bool)> {
         return None;
     }
     Some((name.to_string(), rest[1..].to_string(), append))
+}
+
+/// `|&`'s desugaring: `2>&1` appended to the LEFT stage's own redirects,
+/// after whatever it already carries. bash prints `echo a 2>/dev/null |& cat`
+/// back as `echo a 2> /dev/null 2>&1 | cat`, so the order is not free.
+fn merge_stderr_into_stdout(cmd: Command) -> Command {
+    let merge = Redirect {
+        op: RedirectOp::DupOut,
+        fd: Some(2),
+        target: Word { text: "1".to_string(), quoted: false },
+        heredoc_body: None,
+    };
+    match cmd {
+        Command::Simple(mut s) => {
+            s.redirects.push(merge);
+            Command::Simple(s)
+        }
+        Command::Redirected { command, mut redirects } => {
+            redirects.push(merge);
+            Command::Redirected { command, redirects }
+        }
+        other => Command::Redirected { command: Box::new(other), redirects: vec![merge] },
+    }
 }
 
 fn is_name(s: &str) -> bool {
@@ -743,6 +832,102 @@ mod tests {
             Command::Simple(s) => s,
             other => panic!("expected Simple, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_empty_program_parses_as_a_command_that_does_nothing() {
+        // bash -n accepts "", "# c" and a run of blank lines.
+        for src in ["", "\n\n", "# comment\n", "\n# comment\n\n"] {
+            let cmd = parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            let s = simple(&cmd);
+            assert!(s.program.is_none());
+            assert!(s.assignments.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_empty_compound_list_is_still_an_error() {
+        // bash -n rejects `( )` and `{ }`.
+        assert!(parse("( )").is_err());
+        assert!(parse("{ }").is_err());
+    }
+
+    #[test]
+    fn pipe_ampersand_sends_stderr_down_the_pipe_after_the_stages_own_redirects() {
+        // bash prints `echo a 2>/dev/null |& cat` back as
+        // `echo a 2> /dev/null 2>&1 | cat`, so the merge lands last.
+        let cmd = parse("echo a 2>/dev/null |& cat").unwrap();
+        let Command::Connection(c) = &cmd else { panic!("expected a pipeline, got {cmd:?}") };
+        assert_eq!(c.connector, Connector::Pipe);
+        let left = simple(&c.left);
+        let ops: Vec<_> = left.redirects.iter().map(|r| (r.op, r.fd, r.target.text.as_str())).collect();
+        assert_eq!(ops, vec![(RedirectOp::Out, Some(2), "/dev/null"), (RedirectOp::DupOut, Some(2), "1")]);
+    }
+
+    #[test]
+    fn bang_and_time_each_take_an_empty_pipeline() {
+        // bash runs all three: `!` exits 1, `! !` exits 0, `time` times
+        // nothing and still prints its format.
+        for src in ["!", "! !", "time", "time -p", "time --", "{ time; echo after; }"] {
+            parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+        }
+        let Command::Invert(inner) = parse("!").unwrap() else { panic!("expected invert") };
+        assert!(simple(&inner).program.is_none());
+    }
+
+    #[test]
+    fn arith_for_accepts_a_brace_body() {
+        // Only the `for ((...))` form takes it: `for x in a b { ...; }` and
+        // `while c { ...; }` are syntax errors in bash.
+        let cmd = parse("for ((i=0; i<2; i++)) { echo $i; }").unwrap();
+        let Command::ArithFor { expr, body } = &cmd else { panic!("expected arith-for, got {cmd:?}") };
+        assert_eq!(expr, "((i=0; i<2; i++))");
+        assert_eq!(simple(body).program.as_ref().unwrap().text, "echo");
+        assert!(parse("for x in a b { echo $x; }").is_err());
+        assert!(parse("while true { echo x; }").is_err());
+    }
+
+    #[test]
+    fn parens_inside_a_cond_need_no_surrounding_spaces() {
+        // bash prints `[[ (-n a) ]]` back as `[[ ( -n a ) ]]`.
+        let cmd = parse("[[ (-n a) ]]").unwrap();
+        let Command::Cond(CondExpr::Group(inner)) = &cmd else { panic!("expected a group, got {cmd:?}") };
+        assert!(matches!(&**inner, CondExpr::Unary { op, operand } if op == "-n" && operand.text == "a"));
+        parse("[[ ( $t -gt 0 && $r = t) || ($t -eq 0 && $r = f) ]]").unwrap();
+    }
+
+    #[test]
+    fn a_cond_paren_that_belongs_to_a_pattern_is_not_a_group() {
+        // An extglob head keeps its parens (`[[ ]]` reads extglob whatever
+        // shopt says), and so does the operand after `=~`.
+        let cmd = parse("[[ ab == @(a)b ]]").unwrap();
+        let Command::Cond(CondExpr::Binary { right, .. }) = &cmd else { panic!("got {cmd:?}") };
+        assert_eq!(right.text, "@(a)b");
+        let cmd = parse("[[ abc =~ ^(a|b) ]]").unwrap();
+        let Command::Cond(CondExpr::Binary { right, .. }) = &cmd else { panic!("got {cmd:?}") };
+        assert_eq!(right.text, "^(a|b)");
+    }
+
+    #[test]
+    fn a_function_name_is_any_word_that_is_not_an_assignment() {
+        // bash defines all of these; only `a=b() { :; }` is a syntax error,
+        // because `a=b` lexes as an assignment before the `(` is reached.
+        for name in ["foo-a", "foo.bar", "1foo", "a/b", "a%b"] {
+            let src = format!("{name}() {{ echo x; }}");
+            let cmd = parse(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let Command::FunctionDef { name: got, .. } = &cmd else { panic!("got {cmd:?}") };
+            assert_eq!(got, name);
+        }
+    }
+
+    #[test]
+    fn clobbering_redirect_is_an_ordinary_output_redirect() {
+        // `>|` only differs from `>` under noclobber, which the walker
+        // refuses outright.
+        let cmd = parse("echo b >| /tmp/x").unwrap();
+        let s = simple(&cmd);
+        assert_eq!(s.redirects[0].op, RedirectOp::Out);
+        assert_eq!(s.redirects[0].target.text, "/tmp/x");
     }
 
     #[test]
