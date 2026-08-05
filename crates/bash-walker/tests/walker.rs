@@ -1384,3 +1384,48 @@ fn ansi_c_quoting_survives_inside_a_command_substitution() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn a_backtick_substitution_is_opaque_to_brace_expansion() {
+    let expected = "foo 1 2 bar\n";
+
+    let (actual, _) = run("echo `echo foo {1,2} bar`");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_character_range_needs_both_ends_alphabetic() {
+    let expected = "{1..f}\n";
+
+    let (actual, _) = run("echo {1..f}");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_quoted_comma_does_not_separate_brace_alternatives() {
+    let expected = "{x,x}\n";
+
+    let (actual, _) = run("echo {\"x,x\"}");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_comma_inside_a_substitution_does_not_separate_brace_alternatives() {
+    let expected = "a,b z\n";
+
+    let (actual, _) = run("echo {$(echo a,b),z}");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn uid_expands_to_the_real_user_id() {
+    let expected = "same\n";
+
+    let (actual, _) = run("test \"$UID\" = \"$(id -u)\" && echo same");
+
+    assert_eq!(actual, expected);
+}
