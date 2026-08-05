@@ -924,7 +924,7 @@ fn param_lookup(ex: &mut Exec, name: &str) -> Option<Expanded> {
         "!" => ex.state.last_background_pid.map(|p| p.to_string()),
         "#" => Some(ex.state.positional.len().to_string()),
         "@" | "*" => return Some(Expanded::Many(ex.state.positional.clone())),
-        "-" => Some(String::new()),
+        "-" => Some(ex.state.flags.option_letters()),
         "0" => Some(ex.state.script_name.clone()),
         // The pid of the shell itself. Bash re-evaluates it per subshell; this
         // is the process, which is right everywhere the walker forks and wrong

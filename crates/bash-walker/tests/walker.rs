@@ -465,6 +465,78 @@ fn nounset_still_fails_an_operator_that_reads_an_unset_parameter() {
 }
 
 #[test]
+fn errexit_ignores_a_failure_that_is_not_the_last_command_of_an_and_list() {
+    let (output, _) = run("set -e; false && echo ran; echo after");
+
+    let expected = "after\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn errexit_exits_on_the_last_command_of_an_and_list() {
+    let (_, status) = run("set -e; true && false; echo after");
+
+    let expected = 1;
+    assert_eq!(status, expected);
+}
+
+#[test]
+fn errexit_is_suppressed_inside_a_loop_body_whose_loop_is_being_tested() {
+    let (output, _) = run("set -e; for f in 1 2; do echo body $f; false; done && echo ran; echo after");
+
+    let expected = "body 1\nbody 2\nafter\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn errexit_is_suppressed_inside_an_eval_that_is_a_condition() {
+    let (output, _) = run("set -e; if eval false; then echo then; fi; echo after");
+
+    let expected = "after\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn errexit_ends_the_pipeline_stage_it_fails_in_and_not_the_shell() {
+    let (output, _) = run("set -e; { false; echo inside; } | cat; echo after");
+
+    let expected = "after\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn dollar_dash_reports_the_options_in_effect() {
+    let (output, _) = run("set -e; echo $-");
+
+    let expected = "ehB\n";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn builtin_runs_the_builtin_a_function_of_the_same_name_shadows() {
+    let (_, status) = run("false() { echo function; }; builtin false");
+
+    let expected = 1;
+    assert_eq!(status, expected);
+}
+
+#[test]
+fn printf_pads_an_integer_to_its_precision() {
+    let (output, _) = run("printf '[%.2d]' 5");
+
+    let expected = "[05]";
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn printf_prints_nothing_for_zero_at_zero_precision() {
+    let (output, _) = run("printf '[%.0d]' 0");
+
+    let expected = "[]";
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn unquoted_expansion_splits_quoted_does_not() {
     let (output, _) = run("x='a b'; printf '[%s]' $x; printf '[%s]' \"$x\"");
 

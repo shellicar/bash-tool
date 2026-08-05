@@ -137,6 +137,10 @@ impl<'a> Exec<'a> {
         Ok(f)
     }
 
+    /// `tested` means something else decides what this command's status means,
+    /// so `set -e` must not act on it. It reaches as far as the command runs:
+    /// bash suppresses errexit for the whole dynamic extent of a tested
+    /// command, so a loop or conditional passes it on to its body.
     pub fn exec(&mut self, cmd: &Command, ctx: &Ctx, tested: bool) -> Result<i32, Flow> {
         let substituted;
         let ctx = if !ctx.derived && self.shared.persistent_ctx.is_some() {
@@ -208,23 +212,23 @@ impl<'a> Exec<'a> {
                 } else {
                     expand::expand_fields(self, ctx, &words)?
                 };
-                self.run_loop_values(&f.var, &values, &f.body, ctx)
+                self.run_loop_values(&f.var, &values, &f.body, ctx, tested)
             }
-            Command::ArithFor { expr, body } => self.exec_arith_for(expr, body, ctx),
+            Command::ArithFor { expr, body } => self.exec_arith_for(expr, body, ctx, tested),
             Command::If(i) => {
                 for (cond_cmd, body) in &i.branches {
                     if self.exec(cond_cmd, ctx, true)? == 0 {
-                        return self.exec(body, ctx, false);
+                        return self.exec(body, ctx, tested);
                     }
                 }
                 match &i.else_branch {
-                    Some(e) => self.exec(e, ctx, false),
+                    Some(e) => self.exec(e, ctx, tested),
                     None => Ok(0),
                 }
             }
-            Command::Case(c) => self.exec_case(c, ctx),
-            Command::While { cond, body } => self.exec_while(cond, body, ctx, false),
-            Command::Until { cond, body } => self.exec_while(cond, body, ctx, true),
+            Command::Case(c) => self.exec_case(c, ctx, tested),
+            Command::While { cond, body } => self.exec_while(cond, body, ctx, false, tested),
+            Command::Until { cond, body } => self.exec_while(cond, body, ctx, true, tested),
             Command::Cond(expr) => {
                 let ok = cond::eval(self, ctx, expr)?;
                 Ok(i32::from(!ok))
@@ -277,14 +281,19 @@ impl<'a> Exec<'a> {
     /// own semantics. External simple commands spawn concurrently connected
     /// by real OS pipes; walker-internal stages run inline, buffering into
     /// an anonymous temp file when something downstream needs their output.
-    fn exec_pipeline(&mut self, stages: &[Command], ctx: &Ctx, _tested: bool) -> Result<i32, Flow> {
+    fn exec_pipeline(&mut self, stages: &[Command], ctx: &Ctx, tested: bool) -> Result<i32, Flow> {
         let saved_pctx = self.shared.persistent_ctx.clone();
-        let r = self.exec_pipeline_inner(stages, ctx);
+        let r = self.exec_pipeline_inner(stages, ctx, tested);
         self.shared.persistent_ctx = saved_pctx;
         r
     }
 
-    fn exec_pipeline_inner(&mut self, stages: &[Command], ctx: &Ctx) -> Result<i32, Flow> {
+    fn exec_pipeline_inner(
+        &mut self,
+        stages: &[Command],
+        ctx: &Ctx,
+        tested: bool,
+    ) -> Result<i32, Flow> {
         let n = stages.len();
         let mut statuses: Vec<Option<i32>> = vec![None; n];
         let mut waiting: Vec<Option<Child>> = Vec::with_capacity(n);
@@ -389,7 +398,10 @@ impl<'a> Exec<'a> {
             let handle = std::thread::spawn(move || -> i32 {
                 let mut shared = Shared { clock, entropy, subst_depth, ..Shared::default() };
                 let mut sub = Exec { state: &mut stage_state, shared: &mut shared };
-                match sub.exec(&stage_cmd, &stage_ctx, true) {
+                // A stage is a subshell, so `set -e` inside one ends the
+                // stage and reports its status; the pipeline decides for
+                // itself whether the shell then exits.
+                match sub.exec(&stage_cmd, &stage_ctx, tested) {
                     Ok(st) => st,
                     Err(Flow::Exit(st)) | Err(Flow::Return(st)) => st,
                     Err(Flow::Break(_)) | Err(Flow::Continue(_)) => 0,
@@ -453,6 +465,7 @@ impl<'a> Exec<'a> {
         body: &Command,
         ctx: &Ctx,
         until: bool,
+        tested: bool,
     ) -> Result<i32, Flow> {
         let mut status = 0;
         self.shared.loop_depth += 1;
@@ -465,7 +478,7 @@ impl<'a> Exec<'a> {
             if !run_body {
                 break Ok(status);
             }
-            match self.exec(body, ctx, false) {
+            match self.exec(body, ctx, tested) {
                 Ok(st) => status = st,
                 Err(Flow::Break(1)) => break Ok(status),
                 Err(Flow::Break(k)) => break Err(Flow::Break(k - 1)),
@@ -484,6 +497,7 @@ impl<'a> Exec<'a> {
         values: &[String],
         body: &Command,
         ctx: &Ctx,
+        tested: bool,
     ) -> Result<i32, Flow> {
         let mut status = 0;
         self.shared.loop_depth += 1;
@@ -495,7 +509,7 @@ impl<'a> Exec<'a> {
         for v in values {
             self.xtrace(ctx, &header);
             self.state.set_var(var, v.clone());
-            match self.exec(body, ctx, false) {
+            match self.exec(body, ctx, tested) {
                 Ok(st) => status = st,
                 Err(Flow::Break(1)) => break,
                 Err(Flow::Break(k)) => {
@@ -517,7 +531,13 @@ impl<'a> Exec<'a> {
         result.map(|()| status)
     }
 
-    fn exec_arith_for(&mut self, expr: &str, body: &Command, ctx: &Ctx) -> Result<i32, Flow> {
+    fn exec_arith_for(
+        &mut self,
+        expr: &str,
+        body: &Command,
+        ctx: &Ctx,
+        tested: bool,
+    ) -> Result<i32, Flow> {
         let inner = expr.trim_start_matches("((").trim_end_matches("))");
         let parts: Vec<&str> = inner.split(';').collect();
         if parts.len() != 3 {
@@ -539,7 +559,7 @@ impl<'a> Exec<'a> {
                 Ok(_) => {}
                 Err(f) => break Err(f),
             }
-            match self.exec(body, ctx, false) {
+            match self.exec(body, ctx, tested) {
                 Ok(st) => status = st,
                 Err(Flow::Break(1)) => break Ok(status),
                 Err(Flow::Break(k)) => break Err(Flow::Break(k - 1)),
@@ -555,7 +575,12 @@ impl<'a> Exec<'a> {
         result
     }
 
-    fn exec_case(&mut self, c: &bash_parser::CaseCommand, ctx: &Ctx) -> Result<i32, Flow> {
+    fn exec_case(
+        &mut self,
+        c: &bash_parser::CaseCommand,
+        ctx: &Ctx,
+        tested: bool,
+    ) -> Result<i32, Flow> {
         let subject = expand::expand_single(self, ctx, &c.word)?;
         // Bash traces the header with the subject UNEXPANDED, as written:
         // `case $subject in`, not `case abc in`. It is the one trace line that
@@ -583,7 +608,7 @@ impl<'a> Exec<'a> {
                 continue;
             }
             if let Some(body) = &arm.body {
-                status = self.exec(body, ctx, false)?;
+                status = self.exec(body, ctx, tested)?;
             }
             match arm.terminator {
                 bash_parser::CaseTerminator::Stop => return Ok(status),
@@ -744,7 +769,7 @@ impl<'a> Exec<'a> {
         }
     }
 
-    fn exec_simple(&mut self, s: &SimpleCommand, ctx: &Ctx, _tested: bool) -> Result<i32, Flow> {
+    fn exec_simple(&mut self, s: &SimpleCommand, ctx: &Ctx, tested: bool) -> Result<i32, Flow> {
         self.shared.last_capture_status = None;
 
         // Declaration builtins get assignment-style argument expansion:
@@ -804,11 +829,11 @@ impl<'a> Exec<'a> {
         let args = &fields[1..];
 
         if let Some(body) = self.state.funcs.get(&name).cloned() {
-            return self.call_function(&body, args, &assigns, &ctx2);
+            return self.call_function(&body, args, &assigns, &ctx2, tested);
         }
         if builtins::is_builtin(&name) {
             return self.with_temp_assigns(&assigns, |ex| {
-                builtins::run(ex, &ctx2, &name, args)
+                builtins::run(ex, &ctx2, &name, args, tested)
             });
         }
         match self.spawn(&fields, &assigns, &ctx2)?.take() {
@@ -892,6 +917,7 @@ impl<'a> Exec<'a> {
         args: &[String],
         assigns: &[(String, String)],
         ctx: &Ctx,
+        tested: bool,
     ) -> Result<i32, Flow> {
         let saved_positional = std::mem::replace(&mut self.state.positional, args.to_vec());
         self.state.locals.push(std::collections::HashMap::new());
@@ -899,7 +925,7 @@ impl<'a> Exec<'a> {
             self.state.declare_local(k, Some(v.clone()));
         }
         self.shared.func_depth += 1;
-        let r = self.exec(body, ctx, false);
+        let r = self.exec(body, ctx, tested);
         self.shared.func_depth -= 1;
         self.state.locals.pop();
         self.state.positional = saved_positional;
@@ -1153,11 +1179,17 @@ impl SpawnSlot {
     }
 }
 
+/// Whether a non-zero status from this node is the shell's to exit on under
+/// `set -e`. A `;` list is not a command: each element already answered this
+/// question for itself, so judging the list again exits on a status the
+/// element it came from was exempt from.
 fn errexit_eligible(cmd: &Command) -> bool {
     !matches!(
         cmd,
-        Command::Connection(Connection { connector: Connector::And | Connector::Or, .. })
-            | Command::Invert(_)
+        Command::Connection(Connection {
+            connector: Connector::And | Connector::Or | Connector::Seq,
+            ..
+        }) | Command::Invert(_)
             | Command::FunctionDef { .. }
     )
 }

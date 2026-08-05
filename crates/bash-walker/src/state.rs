@@ -42,6 +42,45 @@ pub struct Flags {
     pub nounset: bool,
     /// `set -o pipefail`: a pipeline fails if any stage fails.
     pub pipefail: bool,
+    /// Started as `-c`. Not a `set` option, but `$-` reports it alongside them.
+    pub dash_c: bool,
+}
+
+impl Flags {
+    /// One `set`-style option letter, as `set` and the command line both take
+    /// them. `Err` carries the letter back so each caller can word its own
+    /// refusal, since bash's wording differs between the two.
+    pub fn set_letter(&mut self, letter: char, on: bool) -> Result<(), char> {
+        match letter {
+            'e' => self.errexit = on,
+            'x' => self.xtrace = on,
+            'u' => self.nounset = on,
+            other => return Err(other),
+        }
+        Ok(())
+    }
+
+    /// `$-`, in bash's own option order. `h` (hashall) and `B` (braceexpand)
+    /// are always on: bash defaults them on, `set +h`/`set +B` are refusals
+    /// here, so no reachable state has them off. `pipefail` has no letter.
+    pub fn option_letters(&self) -> String {
+        let mut s = String::new();
+        if self.errexit {
+            s.push('e');
+        }
+        s.push('h');
+        if self.nounset {
+            s.push('u');
+        }
+        if self.xtrace {
+            s.push('x');
+        }
+        s.push('B');
+        if self.dash_c {
+            s.push('c');
+        }
+        s
+    }
 }
 
 #[derive(Debug, Clone)]

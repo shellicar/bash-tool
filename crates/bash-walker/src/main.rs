@@ -135,16 +135,40 @@ fn main() {
     // path with its own arguments, or the JSON-on-stdin form the harness uses.
     // The script-path form exists because that is how a shell is invoked, and
     // bash's own test suite drives `$THIS_SH ./name.tests` that way.
+    // Option letters bundle as bash's do, so `-ce` is `-c` plus `set -e`.
+    // Bash's own test suite invokes `$THIS_SH -ce 'script'` throughout.
+    let mut dash_c = false;
+    while let Some(first) = args.first() {
+        let Some(letters) = first.strip_prefix('-') else { break };
+        if letters.is_empty() || !letters.chars().all(|c| c.is_ascii_alphabetic()) {
+            break;
+        }
+        for c in letters.chars() {
+            if c == 'c' {
+                dash_c = true;
+            } else if let Err(bad) = state.flags.set_letter(c, true) {
+                eprintln!("bash-walker: -{bad}: not supported by bash-walker");
+                std::process::exit(2);
+            }
+        }
+        args.remove(0);
+        if dash_c {
+            state.flags.dash_c = true;
+            break;
+        }
+    }
+
     let (command, direct) = match args.first().map(String::as_str) {
-        Some("-c") => match args.get(1) {
+        _ if dash_c => match args.first() {
             Some(c) => {
                 // `bash -c script name arg...` sets $0 to name and $1 onward
                 // to the rest, so a script can report its own name.
-                if let Some(name) = args.get(2) {
+                let c = c.clone();
+                if let Some(name) = args.get(1) {
                     state.script_name = name.clone();
-                    state.positional = args[3..].to_vec();
+                    state.positional = args[2..].to_vec();
                 }
-                (c.clone(), true)
+                (c, true)
             }
             None => {
                 eprintln!("bash-walker: -c requires a script argument");

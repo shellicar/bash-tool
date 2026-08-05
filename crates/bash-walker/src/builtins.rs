@@ -12,20 +12,28 @@ use crate::walk::{Ctx, Exec, Flow};
 const NATIVE: &[&str] = &[
     "cd", "pwd", "export", "unset", "local", "exit", "return", "break", "continue", "shift",
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
-    "echo", "printf", "exec", "umask",
+    "echo", "printf", "exec", "umask", "builtin",
 ];
 
 const UNSUPPORTED: &[&str] = &[
     "declare", "typeset", "readonly", "alias", "unalias", "trap", "getopts", "ulimit",
     "jobs", "fg", "bg", "hash", "type", "help", "history", "disown", "suspend", "times",
-    "builtin", "caller", "enable", "pushd", "popd", "dirs", "mapfile", "readarray",
+    "caller", "enable", "pushd", "popd", "dirs", "mapfile", "readarray",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
     NATIVE.contains(&name) || UNSUPPORTED.contains(&name)
 }
 
-pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32, Flow> {
+/// `tested` is the caller's errexit context, which `eval` and `source` carry
+/// into the code they run: `if eval false` is a condition all the way down.
+pub fn run(
+    ex: &mut Exec,
+    ctx: &Ctx,
+    name: &str,
+    args: &[String],
+    tested: bool,
+) -> Result<i32, Flow> {
     match name {
         "cd" => cd(ex, ctx, args),
         "pwd" => {
@@ -117,7 +125,7 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
             if src.trim().is_empty() {
                 return Ok(0);
             }
-            crate::walk::run_source(ex, ctx, &src, false)
+            crate::walk::run_source(ex, ctx, &src, tested)
         }
         "source" | "." => {
             let Some(path) = args.first() else {
@@ -131,7 +139,7 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
             } else {
                 None
             };
-            let r = crate::walk::run_source(ex, ctx, &src, false);
+            let r = crate::walk::run_source(ex, ctx, &src, tested);
             if let Some(p) = saved {
                 ex.state.positional = p;
             }
@@ -148,6 +156,16 @@ pub fn run(ex: &mut Exec, ctx: &Ctx, name: &str, args: &[String]) -> Result<i32,
         "echo" => echo(ctx, args),
         "printf" => printf(ex, ctx, args),
         "command" => command(ex, ctx, args),
+        // Runs the builtin even where a function of the same name shadows it,
+        // which is what dispatching here rather than through exec_simple gives.
+        "builtin" => match args.split_first() {
+            None => Ok(0),
+            Some((first, rest)) if is_builtin(first) => run(ex, ctx, first, rest, tested),
+            Some((first, _)) => {
+                ctx.write_err(&format!("bash-walker: builtin: {first}: not a shell builtin\n"));
+                Ok(1)
+            }
+        },
         "umask" => umask(ex, ctx, args),
         // `exec` with only redirects rewires the shell itself for the rest
         // of the invocation (the redirects were already applied into this
@@ -455,11 +473,19 @@ fn render_conversion(
                 }
                 0
             });
-            let mut s = match conv {
+            let digits = match conv {
                 'o' => format!("{v:o}"),
                 'x' => format!("{v:x}"),
                 'X' => format!("{v:X}"),
                 _ => v.abs().to_string(),
+            };
+            // For an integer a precision is the minimum number of digits, so
+            // it zero-pads the number itself rather than the field, sits
+            // inside the sign, and prints zero as nothing at all.
+            let mut s = match prec {
+                Some(0) if v == 0 => String::new(),
+                Some(p) if digits.len() < p => format!("{}{digits}", "0".repeat(p - digits.len())),
+                _ => digits,
             };
             if matches!(conv, 'd' | 'i' | 'u') {
                 if v < 0 {
@@ -471,13 +497,17 @@ fn render_conversion(
                 }
             } else if flags.contains('#') && v != 0 {
                 s = match conv {
+                    'o' if s.starts_with('0') => s,
                     'o' => format!("0{s}"),
                     'x' => format!("0x{s}"),
                     'X' => format!("0X{s}"),
                     _ => s,
                 };
             }
-            return pad_number(out, &s, flags, width);
+            // A precision cancels the `0` flag: the zeros are already in the
+            // number, and the field pads with spaces.
+            let field_flags = if prec.is_some() { flags.replace('0', "") } else { flags.to_string() };
+            return pad_number(out, &s, &field_flags, width);
         }
         'e' | 'E' | 'f' | 'F' | 'g' | 'G' => {
             let a = next_arg(args, argi).unwrap_or_default();
@@ -811,17 +841,12 @@ fn set(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
             flag if flag.starts_with('-') || flag.starts_with('+') => {
                 let on = flag.starts_with('-');
                 for c in flag[1..].chars() {
-                    match c {
-                        'e' => ex.state.flags.errexit = on,
-                        'x' => ex.state.flags.xtrace = on,
-                        'u' => ex.state.flags.nounset = on,
-                        // -f (noglob), -C, ... are behaviour changes we don't
-                        // implement; failing loud beats silently differing.
-                        other => {
-                            return Err(Flow::Fatal(format!(
-                                "set -{other}: not supported by bash-walker"
-                            )))
-                        }
+                    // -f (noglob), -C, ... are behaviour changes we don't
+                    // implement; failing loud beats silently differing.
+                    if let Err(other) = ex.state.flags.set_letter(c, on) {
+                        return Err(Flow::Fatal(format!(
+                            "set -{other}: not supported by bash-walker"
+                        )));
                     }
                 }
             }
