@@ -2,7 +2,7 @@
 // Runs GNU Bash's own test suite against bash-walker and reports where they
 // differ.
 //
-//   node tools/conformance.mjs [name...] [--accept] [--walker PATH]
+//   node tools/conformance.mjs [name...] [--accept] [--walker PATH] [--image TAG]
 //
 // A ratchet, not a report. `conformance-baseline.json` records which
 // tests are known to fail; a test outside it that fails is a regression and
@@ -34,7 +34,10 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
-const IMAGE = "bash-conformance";
+// --image so a rebuilt world can be tried under its own tag without
+// overwriting the one everything else is currently measured against.
+const imageAt = process.argv.indexOf("--image");
+const IMAGE = imageAt >= 0 ? process.argv[imageAt + 1] : "bash-conformance";
 // Paths inside the image, fixed by the Dockerfile.
 const BASH = "/src/bash";
 const WALKER = "/walker";
@@ -47,7 +50,7 @@ const TIMEOUT = 900_000;
 
 const only = process.argv
   .slice(2)
-  .filter((a, i, all) => !a.startsWith("-") && all[i - 1] !== "--walker");
+  .filter((a, i, all) => !a.startsWith("-") && all[i - 1] !== "--walker" && all[i - 1] !== "--image");
 const verbose = process.argv.includes("--verbose");
 const accept = process.argv.includes("--accept");
 const BASELINE = `${ROOT}/conformance-baseline.json`;

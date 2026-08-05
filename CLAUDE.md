@@ -179,6 +179,34 @@ keeping its backslash when no digits follow, and a NUL ending the segment while
 the word carries on); only the representation is left, so the test cannot close
 until this does.
 
+**Collating symbols and equivalence classes in patterns (2026-08-05).**
+`[[.a.]]` and `[[=b=]]` inside a bracket expression are locale-collation
+features, so there is no translation to a plain range: the answer depends on the
+locale's collation table. Supporting them means replacing the matcher, and the
+matcher is used by `case`, `[[ == ]]`, `${x#pat}`, `${x%pat}`, `${x/a/b}` and
+pathname expansion, so every one of those is in scope for regression. Declined
+for constructs almost nobody writes. `posixpat` needs them, so it stays failed.
+
+POSIX character classes are the other half of that test and are NOT declined.
+They are a small, safe fix that has not been done yet. The `glob` crate handles
+bracket expressions correctly but does not know the twelve class names, and it
+does not error on them, it silently matches nothing: `[[:xdigit:]]` against `e`
+returns false where `[0-9a-fA-F]` returns true. So `case e in [[:xdigit:]])`
+quietly takes the wrong branch today, which is the silent-wrong class this
+project exists to remove. The fix is a translation table over the twelve names,
+applied to the pattern before it reaches the matcher. It is low risk because the
+only patterns whose behaviour changes are ones that match nothing today. It is
+ASCII and the C locale only, which is a limitation to write down rather than a
+reason not to do it.
+
+**Brace expansion's remaining cases (2026-08-05).** Bash does not re-scan
+expansion output for substitutions but does quote-remove it, so `{a..A}` yields
+a literal backtick the walker reads as a substitution opener and a literal
+backslash bash's quote removal eats. Matching it means the expander telling text
+that came out of an expansion apart from text the parser saw, which is a
+provenance change wanting a design rather than a fix at the edges. Parked. The
+same defect is behind `"${a+'$('\'}"`.
+
 **Arrays.** Unimplemented, and half-silent: subscripts refuse loudly, but
 `arr=(a b c)` is accepted and stores the literal text, so `$arr` gives
 `(a b c)` where bash gives `a`, and `files=(*.log)` does not glob.
