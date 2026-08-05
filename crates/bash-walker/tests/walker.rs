@@ -1501,3 +1501,74 @@ fn declaring_an_exported_name_with_no_value_keeps_it_out_of_the_environment() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn shopt_reports_an_option_and_its_state() {
+    let expected = ("cmdhist             \ton\nnullglob            \toff\n".to_string(), 1);
+
+    let actual = run("shopt cmdhist nullglob");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn shopt_p_prints_the_command_that_would_restore_the_option() {
+    let expected = ("shopt -s sourcepath\nshopt -u nullglob\n".to_string(), 1);
+
+    let actual = run("shopt -p sourcepath nullglob");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn shopt_remembers_an_option_that_changes_nothing_about_how_a_script_runs() {
+    let expected = ("checkwinsize        \toff\n".to_string(), 1);
+
+    let actual = run("shopt -u checkwinsize; shopt checkwinsize");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn shopt_refuses_by_name_an_option_the_walker_does_not_have() {
+    let (output, status) = run("shopt -s nullglob");
+
+    assert_ne!(status, 0);
+    assert!(output.contains("shopt -s nullglob: not supported"), "{output}");
+}
+
+#[test]
+fn shopt_rejects_a_name_that_is_not_an_option() {
+    let (output, status) = run("shopt -p xyz1");
+
+    assert_eq!(status, 1);
+    assert!(output.contains("xyz1: invalid shell option name"), "{output}");
+}
+
+#[test]
+fn set_o_lists_the_options_and_set_plus_o_lists_the_commands() {
+    let (table, _) = run("set -o");
+    let (commands, _) = run("set +o");
+
+    assert!(table.contains("errexit        \toff\n"), "{table}");
+    assert!(table.contains("interactive-comments\ton\n"), "{table}");
+    assert!(commands.contains("set +o errexit\n"), "{commands}");
+    assert!(commands.contains("set -o braceexpand\n"), "{commands}");
+}
+
+#[test]
+fn the_inert_set_options_are_accepted_and_reported_back() {
+    let expected = ("ehmpB\nset -o history\nset -o monitor\n".to_string(), 0);
+
+    let actual = run("set -e -m -p -o history; echo $-; shopt -p -o history monitor");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_set_option_the_walker_cannot_honour_is_refused_by_name() {
+    let (output, status) = run("set -o noclobber");
+
+    assert_ne!(status, 0);
+    assert!(output.contains("set -o noclobber: not supported"), "{output}");
+}

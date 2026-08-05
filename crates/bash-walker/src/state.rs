@@ -133,6 +133,133 @@ pub struct PersistedState {
     pub umask: Option<u32>,
 }
 
+/// bash 5.3's `shopt` options and their values in a non-interactive shell,
+/// in the order `shopt` lists them.
+pub const SHOPT_DEFAULTS: &[(&str, bool)] = &[
+    ("array_expand_once", false),
+    ("assoc_expand_once", false),
+    ("autocd", false),
+    ("bash_source_fullpath", false),
+    ("cdable_vars", false),
+    ("cdspell", false),
+    ("checkhash", false),
+    ("checkjobs", false),
+    ("checkwinsize", true),
+    ("cmdhist", true),
+    ("compat31", false),
+    ("compat32", false),
+    ("compat40", false),
+    ("compat41", false),
+    ("compat42", false),
+    ("compat43", false),
+    ("compat44", false),
+    ("complete_fullquote", true),
+    ("direxpand", false),
+    ("dirspell", false),
+    ("dotglob", false),
+    ("execfail", false),
+    ("expand_aliases", false),
+    ("extdebug", false),
+    ("extglob", false),
+    ("extquote", true),
+    ("failglob", false),
+    ("force_fignore", true),
+    ("globasciiranges", true),
+    ("globskipdots", true),
+    ("globstar", false),
+    ("gnu_errfmt", false),
+    ("histappend", false),
+    ("histreedit", false),
+    ("histverify", false),
+    ("hostcomplete", true),
+    ("huponexit", false),
+    ("inherit_errexit", false),
+    ("interactive_comments", true),
+    ("lastpipe", false),
+    ("lithist", false),
+    ("localvar_inherit", false),
+    ("localvar_unset", false),
+    ("login_shell", false),
+    ("mailwarn", false),
+    ("no_empty_cmd_completion", false),
+    ("nocaseglob", false),
+    ("nocasematch", false),
+    ("noexpand_translation", false),
+    ("nullglob", false),
+    ("patsub_replacement", true),
+    ("progcomp", true),
+    ("progcomp_alias", false),
+    ("promptvars", true),
+    ("restricted_shell", false),
+    ("shift_verbose", false),
+    ("sourcepath", true),
+    ("varredir_close", false),
+    ("xpg_echo", false),
+];
+
+/// The options a non-interactive walker cannot exercise either way: line
+/// editing, history, prompts, completion, mail and window size. Changing
+/// one changes nothing about how a script runs, so it is recorded and
+/// reported back rather than refused. Every other option is refused the
+/// moment it is asked for a value the walker does not actually behave as.
+pub const INERT_SHOPTS: &[&str] = &[
+    "autocd",
+    "cdspell",
+    "checkjobs",
+    "checkwinsize",
+    "cmdhist",
+    "complete_fullquote",
+    "direxpand",
+    "dirspell",
+    // The alias table cannot exist here — `alias` itself is refused — so
+    // whether aliases would be expanded can never be observed.
+    "expand_aliases",
+    "force_fignore",
+    "histappend",
+    "histreedit",
+    "histverify",
+    "hostcomplete",
+    "huponexit",
+    "lithist",
+    "login_shell",
+    "mailwarn",
+    "no_empty_cmd_completion",
+    "progcomp",
+    "progcomp_alias",
+    "promptvars",
+];
+
+/// `set -o` option names, in the order bash lists them.
+pub const SET_OPTIONS: &[&str] = &[
+    "allexport",
+    "braceexpand",
+    "emacs",
+    "errexit",
+    "errtrace",
+    "functrace",
+    "hashall",
+    "histexpand",
+    "history",
+    "ignoreeof",
+    "interactive-comments",
+    "keyword",
+    "monitor",
+    "noclobber",
+    "noexec",
+    "noglob",
+    "nolog",
+    "notify",
+    "nounset",
+    "onecmd",
+    "physical",
+    "pipefail",
+    "posix",
+    "privileged",
+    "verbose",
+    "vi",
+    "xtrace",
+];
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Flags {
     /// `set -e`: stop on an untested failure.
@@ -145,6 +272,23 @@ pub struct Flags {
     pub pipefail: bool,
     /// Started as `-c`. Not a `set` option, but `$-` reports it alongside them.
     pub dash_c: bool,
+    /// `set -m`: job control. Nothing here reads it — the walker has no job
+    /// control to turn on — but scripts set it and ask for it back.
+    pub monitor: bool,
+    /// `set -p`: privileged mode, which only changes what a shell imports
+    /// at startup.
+    pub privileged: bool,
+    /// `set -o history`. A non-interactive shell keeps no history, so this
+    /// is a flag scripts carry rather than a behaviour.
+    pub history: bool,
+    /// `set -o emacs` / `set -o vi`: the line editor, which never runs here.
+    pub emacs: bool,
+    pub vi: bool,
+    /// `set -o ignoreeof`, `set -o notify`, `set -o nolog`: interactive and
+    /// history bookkeeping, inert in a script.
+    pub ignoreeof: bool,
+    pub notify: bool,
+    pub nolog: bool,
 }
 
 impl Flags {
@@ -156,9 +300,72 @@ impl Flags {
             'e' => self.errexit = on,
             'x' => self.xtrace = on,
             'u' => self.nounset = on,
+            'm' => self.monitor = on,
+            'p' => self.privileged = on,
+            'b' => self.notify = on,
             other => return Err(other),
         }
         Ok(())
+    }
+
+    /// One `set -o` option by name. `Ok(())` means the walker's behaviour
+    /// now matches what was asked for; `Err(())` means it cannot, and the
+    /// caller refuses by name rather than letting the script believe it.
+    pub fn set_option(&mut self, name: &str, on: bool) -> Result<(), ()> {
+        match name {
+            "errexit" => self.errexit = on,
+            "xtrace" => self.xtrace = on,
+            "nounset" => self.nounset = on,
+            "pipefail" => self.pipefail = on,
+            "monitor" => self.monitor = on,
+            "privileged" => self.privileged = on,
+            "history" => self.history = on,
+            "emacs" => self.emacs = on,
+            "vi" => self.vi = on,
+            "ignoreeof" => self.ignoreeof = on,
+            "notify" => self.notify = on,
+            "nolog" => self.nolog = on,
+            // The rest are real behaviour the walker has exactly one of, so
+            // asking for the value it already has is fine and asking for the
+            // other one is a refusal.
+            other => {
+                return match Self::fixed_option(other) {
+                    Some(v) if v == on => Ok(()),
+                    _ => Err(()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The value of an option the walker does not implement a switch for.
+    fn fixed_option(name: &str) -> Option<bool> {
+        match name {
+            "braceexpand" | "hashall" | "interactive-comments" => Some(true),
+            "allexport" | "errtrace" | "functrace" | "histexpand" | "keyword" | "noclobber"
+            | "noexec" | "noglob" | "onecmd" | "physical" | "posix" | "verbose" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// A `set -o` option's current value, or None if there is no such
+    /// option.
+    pub fn option(&self, name: &str) -> Option<bool> {
+        Some(match name {
+            "errexit" => self.errexit,
+            "xtrace" => self.xtrace,
+            "nounset" => self.nounset,
+            "pipefail" => self.pipefail,
+            "monitor" => self.monitor,
+            "privileged" => self.privileged,
+            "history" => self.history,
+            "emacs" => self.emacs,
+            "vi" => self.vi,
+            "ignoreeof" => self.ignoreeof,
+            "notify" => self.notify,
+            "nolog" => self.nolog,
+            other => return Self::fixed_option(other),
+        })
     }
 
     /// `$-`, in bash's own option order. `h` (hashall) and `B` (braceexpand)
@@ -166,19 +373,20 @@ impl Flags {
     /// here, so no reachable state has them off. `pipefail` has no letter.
     pub fn option_letters(&self) -> String {
         let mut s = String::new();
-        if self.errexit {
-            s.push('e');
-        }
-        s.push('h');
-        if self.nounset {
-            s.push('u');
-        }
-        if self.xtrace {
-            s.push('x');
-        }
-        s.push('B');
-        if self.dash_c {
-            s.push('c');
+        for (on, c) in [
+            (self.notify, 'b'),
+            (self.errexit, 'e'),
+            (true, 'h'),
+            (self.monitor, 'm'),
+            (self.privileged, 'p'),
+            (self.nounset, 'u'),
+            (self.xtrace, 'x'),
+            (true, 'B'),
+            (self.dash_c, 'c'),
+        ] {
+            if on {
+                s.push(c);
+            }
         }
         s
     }
@@ -195,6 +403,10 @@ pub struct ShellState {
     /// `-c` script, and otherwise the shell's own name.
     pub script_name: String,
     pub flags: Flags,
+    /// The `shopt` options whose value differs from bash's default. Only
+    /// the inert options ever reach here: asking for a value the walker
+    /// does not actually behave as is refused by the builtin.
+    pub shopts: std::collections::BTreeSet<String>,
     pub last_status: i32,
     pub last_background_pid: Option<u32>,
     /// `[[ =~ ]]`'s capture groups: whole match at 0, groups after.
@@ -242,6 +454,7 @@ impl Default for ShellState {
             positional: Vec::new(),
             script_name: "bash".to_string(),
             flags: Flags::default(),
+            shopts: Default::default(),
             last_status: 0,
             last_background_pid: None,
             rematch: Vec::new(),
@@ -296,6 +509,24 @@ impl ShellState {
             a.exported = true;
         }
         a
+    }
+
+    /// One `shopt` option's value, or None if there is no such option.
+    pub fn shopt(&self, name: &str) -> Option<bool> {
+        let default = SHOPT_DEFAULTS.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)?;
+        Some(default ^ self.shopts.contains(name))
+    }
+
+    pub fn set_shopt(&mut self, name: &str, on: bool) {
+        let Some(default) = SHOPT_DEFAULTS.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+        else {
+            return;
+        };
+        if default == on {
+            self.shopts.remove(name);
+        } else {
+            self.shopts.insert(name.to_string());
+        }
     }
 
     /// Whether anything here declares the name: a value, or attributes

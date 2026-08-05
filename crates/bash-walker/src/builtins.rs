@@ -14,6 +14,7 @@ const NATIVE: &[&str] = &[
     "cd", "pwd", "export", "unset", "local", "exit", "return", "break", "continue", "shift",
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
     "echo", "printf", "exec", "umask", "builtin", "declare", "typeset", "readonly",
+    "shopt",
 ];
 
 const UNSUPPORTED: &[&str] = &[
@@ -83,6 +84,7 @@ pub fn run(
             Ok(0)
         }
         "set" => set(ex, ctx, args),
+        "shopt" => shopt(ex, ctx, args),
         "read" => read(ex, ctx, args),
         "wait" => {
             // Waiting for every job succeeds; it is `wait PID` that reports the
@@ -1129,19 +1131,27 @@ fn set(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
                 let on = a.starts_with('-');
                 i += 1;
                 match args.get(i).map(String::as_str) {
-                    Some("pipefail") => ex.state.flags.pipefail = on,
-                    Some("errexit") => ex.state.flags.errexit = on,
-                    Some("nounset") => ex.state.flags.nounset = on,
-                    Some("xtrace") => ex.state.flags.xtrace = on,
-                    Some(other) => {
-                        return Err(Flow::Fatal(format!(
-                            "set -o {other}: not supported by bash-walker"
-                        )))
-                    }
+                    // A bare `-o`/`+o` lists every option, `-o` as a table
+                    // and `+o` as the `set` commands that would restore it.
                     None => {
-                        ctx.write_err("bash-walker: set -o: option name required\n");
-                        return Ok(2);
+                        ctx.write_out(&option_listing(ex, on));
+                        return Ok(0);
                     }
+                    Some(name) => match ex.state.flags.set_option(name, on) {
+                        Ok(()) => {}
+                        Err(()) if ex.state.flags.option(name).is_none() => {
+                            ctx.write_err(&format!(
+                                "bash-walker: set: {name}: invalid option name\n"
+                            ));
+                            return Ok(2);
+                        }
+                        Err(()) => {
+                            let sign = if on { '-' } else { '+' };
+                            return Err(Flow::Fatal(format!(
+                                "set {sign}o {name}: not supported by bash-walker"
+                            )));
+                        }
+                    },
                 }
             }
             flag if flag.starts_with('-') || flag.starts_with('+') => {
@@ -1164,6 +1174,152 @@ fn set(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
         i += 1;
     }
     Ok(0)
+}
+
+/// `set -o` prints a table of every option; `set +o` prints the commands
+/// that would put a fresh shell back into this state.
+fn option_listing(ex: &Exec, table: bool) -> String {
+    let mut out = String::new();
+    for name in crate::state::SET_OPTIONS {
+        let on = ex.state.flags.option(name).unwrap_or(false);
+        if table {
+            out.push_str(&format!("{name:<15}\t{}\n", if on { "on" } else { "off" }));
+        } else {
+            out.push_str(&format!("set {}o {name}\n", if on { '-' } else { '+' }));
+        }
+    }
+    out
+}
+
+/// `shopt [-pqsu] [-o] [optname ...]`. The options the walker cannot
+/// actually switch are refused by name when a script asks for the value
+/// the walker does not have; asking for the one it does have is a no-op,
+/// and the inert ones (history, completion, prompts) are simply recorded.
+fn shopt(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    let mut print = false;
+    let mut quiet = false;
+    let mut set_them = false;
+    let mut unset_them = false;
+    let mut set_options = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        for c in a[1..].chars() {
+            match c {
+                'p' => print = true,
+                'q' => quiet = true,
+                's' => set_them = true,
+                'u' => unset_them = true,
+                'o' => set_options = true,
+                other => {
+                    ctx.write_err(&format!(
+                        "bash-walker: shopt: -{other}: invalid option\nshopt: usage: shopt [-pqsu] [-o] [optname ...]\n"
+                    ));
+                    return Ok(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    let names = &args[i..];
+    let changing = set_them != unset_them;
+
+    if names.is_empty() {
+        if !quiet {
+            ctx.write_out(&shopt_listing(ex, set_options, print, set_them, unset_them));
+        }
+        return Ok(0);
+    }
+
+    let mut status = 0;
+    for name in names {
+        let value = if set_options {
+            ex.state.flags.option(name)
+        } else {
+            ex.state.shopt(name)
+        };
+        let Some(current) = value else {
+            let what = if set_options { "invalid option name" } else { "invalid shell option name" };
+            ctx.write_err(&format!("bash-walker: shopt: {name}: {what}\n"));
+            status = 1;
+            continue;
+        };
+        if !changing {
+            if !quiet {
+                ctx.write_out(&shopt_line(name, current, set_options, print));
+            }
+            if !current {
+                status = 1;
+            }
+            continue;
+        }
+        let want = set_them;
+        if current == want {
+            continue;
+        }
+        if set_options {
+            if ex.state.flags.set_option(name, want).is_err() {
+                let sign = if want { '-' } else { '+' };
+                return Err(Flow::Fatal(format!(
+                    "shopt {}o {name} (set {sign}o {name}): not supported by bash-walker",
+                    if want { "-s -" } else { "-u -" }
+                )));
+            }
+            continue;
+        }
+        if !crate::state::INERT_SHOPTS.contains(&name.as_str()) {
+            let flag = if want { "-s" } else { "-u" };
+            return Err(Flow::Fatal(format!(
+                "shopt {flag} {name}: not supported by bash-walker"
+            )));
+        }
+        ex.state.set_shopt(name, want);
+    }
+    Ok(status)
+}
+
+fn shopt_line(name: &str, on: bool, set_options: bool, print: bool) -> String {
+    match (set_options, print) {
+        (false, false) => format!("{name:<20}\t{}\n", if on { "on" } else { "off" }),
+        (false, true) => format!("shopt -{} {name}\n", if on { 's' } else { 'u' }),
+        (true, false) => format!("{name:<15}\t{}\n", if on { "on" } else { "off" }),
+        (true, true) => format!("set {}o {name}\n", if on { '-' } else { '+' }),
+    }
+}
+
+fn shopt_listing(
+    ex: &Exec,
+    set_options: bool,
+    print: bool,
+    only_set: bool,
+    only_unset: bool,
+) -> String {
+    let names: Vec<(String, bool)> = if set_options {
+        crate::state::SET_OPTIONS
+            .iter()
+            .map(|n| ((*n).to_string(), ex.state.flags.option(n).unwrap_or(false)))
+            .collect()
+    } else {
+        crate::state::SHOPT_DEFAULTS
+            .iter()
+            .map(|(n, _)| ((*n).to_string(), ex.state.shopt(n).unwrap_or(false)))
+            .collect()
+    };
+    let mut out = String::new();
+    for (name, on) in names {
+        if (only_set && !on) || (only_unset && on) {
+            continue;
+        }
+        out.push_str(&shopt_line(&name, on, set_options, print));
+    }
+    out
 }
 
 /// One line from the context's stdin, read unbuffered (byte at a time) so
