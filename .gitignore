@@ -1,2 +1,6 @@
 /target
 /target-linux
+
+# The conformance run's own report, rewritten every run. The baseline it is
+# judged against, conformance-baseline.json, is committed.
+conformance-report.json

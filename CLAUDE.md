@@ -1,0 +1,186 @@
+# bash-tool
+
+A bash implementation in Rust, built so that a command can be inspected and
+approved before it runs, and so that the thing approved is the thing that runs.
+Two crates:
+
+- `bash-parser` — text in, tree out. It answers one question: is this bash
+  syntax. It has no opinion about what can be executed.
+- `bash-walker` — executes that tree. Expansion, redirection, pipelines on real
+  OS pipes, job control, builtins, arithmetic, `set -x`, and shell state.
+
+It exists to replace unconstrained `bash -c` as the tool a fleet Claude runs
+commands through. A raw string can only be guessed at before it executes; a
+tree can be read, gated by policy, and then executed as-is.
+
+## Building and testing
+
+```sh
+cargo test --workspace          # the unit and behavioural suites
+node tools/conformance.mjs      # GNU Bash's own 83 test files, as a ratchet
+```
+
+The conformance run needs a real bash 5.3 built at `~/repos/gnu/bash`, and its
+three test helpers built beside the tests, or fourteen files fail for a reason
+that is about neither shell:
+
+```sh
+cc -o tests/recho support/recho.c      # same for zecho and printenv
+```
+
+The replay in the consuming rig mounts a Linux binary, cross-built in a
+container so no toolchain is needed on the host:
+
+```sh
+docker run --rm -v $PWD:/src -w /src -e CARGO_TARGET_DIR=/src/target-linux \
+  rust:alpine sh -c 'apk add --no-cache musl-dev && cargo build --release -p bash-walker'
+```
+
+Work happens in parallel across several worktrees of this repo, so
+`tools/conformance.mjs --walker PATH` points the gate at a specific build.
+`conformance-baseline.json` conflicts on every merge and is derived state:
+regenerate it with `--accept` after merging rather than resolving it.
+
+## Correctness is bash
+
+Bash is the specification. If bash does it, this does it. Nobody working here
+decides what should be supported — that is the SC's, and a session was ended in
+July for deciding it and calling it design.
+
+The oracle is `~/repos/gnu/bash/bash`, a real 5.3 build. Never `/bin/bash` on a
+Mac, which is 3.2.57 from 2007 and wrong about almost everything modern.
+
+Three ways to ask bash a question, in order of how often they settle it:
+
+- **Run it.** Any single question, in seconds.
+- **`set -x`** — bash prints every decision it makes, post-expansion. The
+  walker's trace matches it byte for byte, including PS4's odd rule of
+  repeating only its first character per nesting level.
+- **`declare -f`** — bash prints its own parse tree back. Define the script as
+  a function body and read what bash says it is. This is how parse questions
+  get answered without reading `parse.y`.
+
+Reading the source is the weakest of the three for behaviour. The `&`
+associativity bug survived a careful reading of the grammar because the answer
+is yacc's default shift on an ambiguous rule and appears nowhere in the text.
+
+## The conformance suite is the gate
+
+GNU Bash ships 83 test files. `tools/conformance.mjs` runs each under bash and
+under the walker and compares the two streams separately, rather than against
+the shipped `.right` files: those were captured with `> file 2>&1`, so bash's
+stdio buffering is baked into them, which is not semantics. Cross-stream
+ordering is therefore not tested.
+
+`conformance-baseline.json` records the known failures; a test outside it that
+fails is a regression. It drives the walker by script path, which is why it
+cannot see the invalid-byte gap below.
+
+That suite is the only instrument here that sees ordinary scripting. Do not
+rank gaps by the rig's replay corpus: it is commands an agent wrote fixing
+Python bugs in containers, so it proves what breaks that genre and is silent
+about everything else. Arrays appear zero times in it, and arrays are exactly
+what a careful script uses.
+
+## Unsupported constructs are refused by static inspection, before anything runs
+
+Decided 2026-08-05.
+
+What the walker supports is a separate question from what parses, answered by a
+static pass over the tree that runs before execution begins. If it finds
+anything unimplemented, nothing runs at all.
+
+The tool exists so that what is approved is what happens. A refusal raised
+mid-walk breaks that: everything before the offending line has already run and
+had its side effects, so the caller approved one tree and got part of one with
+no way to tell which part. Refusing up front leaves no partial state to reason
+about.
+
+A construct on a branch that would not have been taken is refused too, and that
+is right rather than a compromise. A script containing `set -o posix` is a
+script written for a shell that has posix mode; whether this run reaches the
+line is luck, not a property of the script.
+
+What the pass cannot see keeps its runtime refusal, so the two are an addition
+and not a replacement. The cases that are only knowable once running:
+
+- text that is computed — `set $opt`, `$(get_flags) --x`, `"${args[@]}"`
+- `eval`, `source`, `bash -c "$x"`, where the thing to inspect does not exist
+  until the moment before it runs
+- aliases, because the alias table is shell state
+
+Both refusals must share one list, or they will drift and disagree about what
+is supported.
+
+What the output owes its reader, who is a Claude and cannot ask a follow-up:
+
+- **Every finding, never the first.** The reader redesigns rather than retries,
+  and a redesign made against half the constraint has to be made again.
+- **Where**: line and column, compiler-style. `shellcheck --format=gcc` is the
+  reference shape; the exact format is not settled.
+- **What**: the construct named precisely. "Not supported" alone gives the
+  reader nothing to act on.
+- **What instead**: a suggestion where a correct one exists, and where none
+  exists, saying so. Silence reads as "you missed an option". A wrong
+  suggestion is worse than none, because it will be followed.
+- **That nothing ran**, in words. Absence of output otherwise reads as success.
+
+## Declined, for now
+
+Recorded so nobody infers the boundary from what happens to fail.
+
+**`set -o posix` (2026-08-05).** Bash consults `posixly_correct` in 186 places
+in hand-written source: 17 in the grammar, and the rest across expansion,
+execution, variables, jobs and 20 builtins. It is a whole-shell mode, not a
+parser flag, so implementing only the piece one test needs would make the
+walker claim posix mode and silently not be in it everywhere else. It gates
+around twenty of bash's own test files. Not decided against, not scheduled.
+
+(Count `posixly_correct` in the bash source excluding `y.tab.c`, which is
+generated from `parse.y` and double-counts the grammar's 17.)
+
+**Byte fidelity for invalid UTF-8 (2026-07-28).** Bash treats shell text as
+opaque bytes; this is built on Rust `String`. Fixing it means a byte-oriented
+word type through lexer, parser, expander and every builtin that touches text,
+then re-validating everything built on top. Worth doing eventually, not now.
+
+There is a severe unfixed manifestation, and it depends on how the walker was
+invoked, which is why it is easy to "disprove" by testing the wrong mode:
+
+```
+-c or JSON, external process emits 0xFF   0 bytes. the whole invocation blanked, exit 0
+script path, same script                  byte-identical to bash
+-c, the walker's own printf '\377'        prints U+00FF. lossy, not blanked
+```
+
+So it is capture mode plus output from an external process. The capture reads
+the buffer into a Rust `String`, that fails, and the error is discarded; script
+path streams to inherited fds and never converts. A `$(...)` around it becomes
+empty for the same reason.
+
+```sh
+bash-walker -c "echo before; /usr/bin/printf '\377'; echo after"
+```
+
+Use `printf`, not `head -c 8 /bin/echo`: Mach-O magic is non-ASCII but an ELF
+header is not, so that reproduces on a Mac and nothing at all in a container.
+
+The consequence that matters: the conformance suite drives the walker by script
+path, so that gate structurally cannot see this. The two modes it does not test
+are the two the tool is actually used through.
+
+**Arrays.** Unimplemented, and half-silent: subscripts refuse loudly, but
+`arr=(a b c)` is accepted and stores the literal text, so `$arr` gives
+`(a b c)` where bash gives `a`, and `files=(*.log)` does not glob.
+
+## Traps
+
+A fix in one place is usually not the fix. `$'...'` was wrong in three separate
+scanners — the lexer's bracket matcher, the `[[ ]]` chunker, and the expander's
+own paren matcher — and only the first had a test pointing at it. The parser
+leaves substitution interiors opaque by design, so the walker re-scans them,
+which is why the same question has more than one implementation.
+
+Test a construct beside a neighbour, not alone. Five passing tests for `&`, all
+with a single command, could not catch that `&` was backgrounding everything
+before it: with nothing to bind wrongly to, the bug had nowhere to show.
