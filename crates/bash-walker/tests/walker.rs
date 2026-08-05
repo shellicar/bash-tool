@@ -1483,3 +1483,12 @@ fn a_nul_ends_the_ansi_c_segment_and_the_word_carries_on() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn an_input_redirect_with_a_descriptor_leaves_stdin_alone() {
+    let expected = "done\n";
+
+    let (actual, _) = run("cat </dev/null 3</etc/hosts; echo done");
+
+    assert_eq!(actual, expected);
+}

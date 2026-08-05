@@ -1068,7 +1068,16 @@ impl<'a> Exec<'a> {
                     let path = expand::expand_redirect_target(self, &c, &r.target)?;
                     let f = File::open(self.state.resolve(&path))
                         .map_err(|e| Flow::RedirectFailed(format!("{path}: {}", errmsg(&e))))?;
-                    c.stdin = Some(Arc::new(f));
+                    // `3<file` opens the file on descriptor 3, not on stdin.
+                    // Ignoring the number sent every input redirect to stdin,
+                    // so `cmd 3<f` fed the command the file it was only meant
+                    // to be able to reach through fd 3.
+                    match r.fd {
+                        None | Some(0) => c.stdin = Some(Arc::new(f)),
+                        Some(n) => {
+                            c.fds.insert(n, Arc::new(f));
+                        }
+                    }
                 }
                 RedirectOp::DupOut => {
                     let target = expand::expand_redirect_target(self, &c, &r.target)?;
