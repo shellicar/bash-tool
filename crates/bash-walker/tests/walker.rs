@@ -1384,3 +1384,38 @@ fn ansi_c_quoting_survives_inside_a_command_substitution() {
 
     assert_eq!(actual, expected);
 }
+
+/// `--inspect` answers whether a script can run and runs none of it. The
+/// script here would print "start" before reaching its first refused
+/// construct, so seeing no output at all is the evidence that inspection
+/// finishes before execution begins.
+#[test]
+fn inspect_reports_every_refused_construct_and_executes_nothing() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bash-walker"))
+        .args([
+            "--inspect",
+            "-c",
+            "echo start\nset -o posix\nselect x in a b; do echo $x; done\ncoproc cat\n",
+        ])
+        .output()
+        .expect("binary should run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "nothing should have run, got {:?}", out.stdout);
+    assert!(stderr.contains("-c:2:5: error: set -o posix:"), "{stderr}");
+    assert!(stderr.contains("-c:3:1: error: select:"), "{stderr}");
+    assert!(stderr.contains("-c:4:1: error: coproc:"), "{stderr}");
+    assert!(stderr.contains("3 constructs cannot be executed"), "{stderr}");
+    assert!(stderr.contains("Nothing ran"), "{stderr}");
+}
+
+#[test]
+fn inspect_approves_a_script_the_walker_can_run() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bash-walker"))
+        .args(["--inspect", "-c", "cd /tmp && ls | wc -l"])
+        .output()
+        .expect("binary should run");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no findings"));
+}

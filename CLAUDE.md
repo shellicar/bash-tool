@@ -2,10 +2,16 @@
 
 A bash implementation in Rust, built so that a command can be inspected and
 approved before it runs, and so that the thing approved is the thing that runs.
-Two crates:
+Three crates, three questions:
 
 - `bash-parser` — text in, tree out. It answers one question: is this bash
   syntax. It has no opinion about what can be executed.
+- `bash-inspect` — reads the source and its tree, and answers whether the
+  walker can execute it, before any of it runs. Pass, or every finding with a
+  location and a suggestion. It currently owns `set -o posix`, `select` and
+  `coproc`; the rest of the unsupported list is still inline in the walker as
+  runtime refusals. Reachable as `bash-walker --inspect <path|-c script>`, not
+  yet on the default execution path.
 - `bash-walker` — executes that tree. Expansion, redirection, pipelines on real
   OS pipes, job control, builtins, arithmetic, `set -x`, and shell state.
 

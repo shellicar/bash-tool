@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bash-parser", "crates/bash-walker"]
+members = ["crates/bash-parser", "crates/bash-inspect", "crates/bash-walker"]
 
 [workspace.package]
 version = "0.1.0"

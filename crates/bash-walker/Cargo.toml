@@ -23,6 +23,7 @@ workspace = true
 # surface entirely.
 [dependencies]
 bash-parser = { path = "../bash-parser" }
+bash-inspect = { path = "../bash-inspect" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

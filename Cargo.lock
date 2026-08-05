@@ -18,6 +18,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "bash-inspect"
+version = "0.1.0"
+dependencies = [
+ "bash-parser",
+]
+
+[[package]]
 name = "bash-parser"
 version = "0.1.0"
 dependencies = [
@@ -31,6 +38,7 @@ name = "bash-walker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bash-inspect",
  "bash-parser",
  "glob",
  "libc",

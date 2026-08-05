@@ -1,0 +1,16 @@
+[package]
+name = "bash-inspect"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# The stage between parsing and execution. bash-parser answers whether text is
+# bash syntax; this answers whether the walker can execute the result, and it
+# answers before any of it runs. A construct refused mid-walk has already let
+# everything above it take effect, so the caller approved one script and got
+# part of one — refusing up front leaves no partial state to reason about
+# (CLAUDE.md, "Unsupported constructs are refused by static inspection").
+[dependencies]
+bash-parser = { path = "../bash-parser" }

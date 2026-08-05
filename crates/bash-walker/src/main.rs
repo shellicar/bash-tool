@@ -68,6 +68,40 @@ fn main() {
         return;
     }
 
+    // Static inspection on its own: answer whether a script can be executed,
+    // and execute none of it either way. The stage is not yet on the default
+    // path (see the crate docs), so this is how the answer is asked for.
+    if args.first().is_some_and(|a| a == "--inspect") {
+        let (origin, src) = match (args.get(1).map(String::as_str), args.get(2)) {
+            (Some("-c"), Some(script)) => ("-c".to_string(), script.clone()),
+            (Some(path), _) if !path.starts_with('-') => match std::fs::read_to_string(path) {
+                Ok(s) => (path.to_string(), s),
+                Err(e) => {
+                    eprintln!("bash-walker: {path}: {}", errmsg(&e));
+                    std::process::exit(2);
+                }
+            },
+            _ => {
+                eprintln!("bash-walker: --inspect requires a script path or -c <script>");
+                std::process::exit(2);
+            }
+        };
+        match bash_inspect::inspect(&src) {
+            Ok(_) => {
+                println!("bash-inspect: no findings. Nothing ran: inspection does not execute.");
+                return;
+            }
+            Err(bash_inspect::Refusal::Unsupported(report)) => {
+                eprint!("{}", report.render(&origin));
+                std::process::exit(1);
+            }
+            Err(bash_inspect::Refusal::Syntax(e)) => {
+                eprintln!("{origin}: syntax error: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     // Background-job child mode: the parent hands the exact AST subtree and
     // shell state on stdin; output streams to the inherited fds. This
     // process IS the background job — a real pid, orphan-safe, like bash's
