@@ -198,6 +198,22 @@ only patterns whose behaviour changes are ones that match nothing today. It is
 ASCII and the C locale only, which is a limitation to write down rather than a
 reason not to do it.
 
+**Extglob outside `[[ ]]`, deferred not declined (2026-08-05).** `shopt -s
+extglob` on one line changes how a later line parses, because bash parses and
+executes a script one command at a time. We parse the whole script up front, so
+the `shopt` cannot reach the lexer, and `?(` `*(` `+(` `@(` `!(` are never word
+syntax outside `[[ ]]`, where they are unconditional because bash makes them so.
+
+Two of bash's tests, `extglob` and `printf`, need it. Note that `bash -n`
+rejects both files too, for the same reason, so this is not the walker being
+worse than bash at reading a file: it is the difference between parsing a script
+and running one.
+
+Closing it means always treating those five as word syntax, which accepts
+slightly more than bash-with-extglob-off does. That is a small lexer change and
+a change to what we support, so it needs the SC. Deferred on 2026-08-05 as not
+understood well enough to decide, not declined.
+
 **Brace expansion's remaining cases (2026-08-05).** Bash does not re-scan
 expansion output for substitutions but does quote-remove it, so `{a..A}` yields
 a literal backtick the walker reads as a substitution opener and a literal
