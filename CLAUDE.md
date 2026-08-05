@@ -17,16 +17,15 @@ tree can be read, gated by policy, and then executed as-is.
 
 ```sh
 cargo test --workspace          # the unit and behavioural suites
+docker compose build            # the conformance world, once
 node tools/conformance.mjs      # GNU Bash's own 83 test files, as a ratchet
 ```
 
-The conformance run needs a real bash 5.3 built at `~/repos/gnu/bash`, and its
-three test helpers built beside the tests, or fourteen files fail for a reason
-that is about neither shell:
-
-```sh
-cc -o tests/recho support/recho.c      # same for zecho and printenv
-```
+The conformance run happens inside a container so both shells share one GNU
+userland; `compose.yaml` builds it. It needs GNU Bash's source at
+`~/repos/gnu/bash`, or `BASH_SRC` pointing elsewhere, and builds bash, its three
+test helpers and every locale the tests ask for itself. It runs as a normal user
+because several of bash's own files refuse to run as root.
 
 The replay in the consuming rig mounts a Linux binary, cross-built in a
 container so no toolchain is needed on the host:

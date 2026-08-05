@@ -57,7 +57,7 @@ const BASELINE = `${ROOT}/conformance-baseline.json`;
 
 if (spawnSync("docker", ["image", "inspect", IMAGE], { stdio: "ignore" }).status !== 0) {
   console.error(`no ${IMAGE} image`);
-  console.error(`cd ~/repos/gnu/bash && docker build --platform linux/amd64 -t ${IMAGE} -f ${ROOT}/tools/conformance.Dockerfile .`);
+  console.error(`build it from ${ROOT}: docker compose build`);
   process.exit(64);
 }
 if (!existsSync(WALKER_HOST)) {
