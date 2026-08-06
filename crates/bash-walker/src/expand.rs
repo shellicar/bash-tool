@@ -122,6 +122,10 @@ pub fn expand_textual(ex: &mut Exec, ctx: &Ctx, raw: &str) -> Result<String, Flo
                 match text {
                     Expanded::One(s) => out.push_str(&s),
                     Expanded::Many(fields) => out.push_str(&fields.join(" ")),
+                    Expanded::Star(fields) => {
+                        let sep = ifs_first(ex);
+                        out.push_str(&fields.join(&sep));
+                    }
                     Expanded::NotSpecial => {
                         out.push(b[i] as char);
                         i += 1;
@@ -522,6 +526,15 @@ fn range_alternatives(inner: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// What `$*` joins with: IFS's first character, a space when IFS is unset, and
+/// nothing at all when IFS is set to the empty string.
+fn ifs_first(ex: &Exec) -> String {
+    match ex.state.get_var("IFS") {
+        None => " ".to_string(),
+        Some(ifs) => ifs.chars().next().map(String::from).unwrap_or_default(),
+    }
+}
+
 fn single_char(s: &str) -> Option<char> {
     let mut it = s.chars();
     let c = it.next()?;
@@ -530,8 +543,12 @@ fn single_char(s: &str) -> Option<char> {
 
 enum Expanded {
     One(String),
-    /// `$@`/`$*`: pre-separated values (the caller decides field breaks).
+    /// `$@`: one field per value (the caller decides the breaks).
     Many(Vec<String>),
+    /// `$*`: the same values, but joined by IFS's first character into a
+    /// single field when quoted. The two are not interchangeable: `"$*"` with
+    /// no positionals is one EMPTY field where `"$@"` is no field at all.
+    Star(Vec<String>),
     /// The `$` was not a live expansion (e.g. `$` at end of word).
     NotSpecial,
 }
@@ -606,6 +623,13 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                                     }
                                     i = next;
                                 }
+                                // `"$*"`: one field however many values there
+                                // are, so an empty list gives an empty field
+                                // and is never suppressed the way `"$@"` is.
+                                (Expanded::Star(vals), next) => {
+                                    lit.push_str(&vals.join(&ifs_first(ex)));
+                                    i = next;
+                                }
                                 (Expanded::NotSpecial, _) => {
                                     lit.push(b[i] as char);
                                     i += 1;
@@ -672,6 +696,18 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                         } else {
                             items.push(Item::Text { s: v.clone(), quoted: false });
                         }
+                    }
+                    i = next;
+                }
+                // Unquoted `$*` joins first and splits after, which is why it
+                // looks like `$@` under a default IFS and stops looking like
+                // it under `IFS=:`.
+                (Expanded::Star(vals), next) => {
+                    let joined = vals.join(&ifs_first(ex));
+                    if split {
+                        push_split(&mut items, &joined, ex);
+                    } else {
+                        items.push(Item::Text { s: joined, quoted: false });
                     }
                     i = next;
                 }
@@ -1048,7 +1084,8 @@ fn param_lookup(ex: &mut Exec, name: &str) -> Option<Expanded> {
         "$" => Some(std::process::id().to_string()),
         "!" => ex.state.last_background_pid.map(|p| p.to_string()),
         "#" => Some(ex.state.positional.len().to_string()),
-        "@" | "*" => return Some(Expanded::Many(ex.state.positional.clone())),
+        "@" => return Some(Expanded::Many(ex.state.positional.clone())),
+        "*" => return Some(Expanded::Star(ex.state.positional.clone())),
         "-" => Some(ex.state.flags.option_letters()),
         "0" => Some(ex.state.script_name.clone()),
         // The pid of the shell itself. Bash re-evaluates it per subshell; this
@@ -1160,9 +1197,21 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
             "${{{inner}}}: arrays are not supported by bash-walker"
         )));
     }
+    // `${*-word}` and its family read `$*` as its joined value, and as unset
+    // when there are no positionals at all. Every other operator on $@/$* acts
+    // per element instead, which is a different shape and still refused.
+    let substitutes = matches!(op.as_bytes().first(), Some(b'-' | b'+' | b'?'))
+        || (op.starts_with(':') && matches!(op.as_bytes().get(1), Some(b'-' | b'+' | b'?')));
     let current = match param_lookup(ex, name) {
         Some(Expanded::One(v)) => Some(v),
-        Some(many @ Expanded::Many(_)) => {
+        Some(Expanded::Star(vals)) if substitutes && !op.is_empty() => {
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.join(&ifs_first(ex)))
+            }
+        }
+        Some(many @ (Expanded::Many(_) | Expanded::Star(_))) => {
             if op.is_empty() {
                 return Ok(many);
             }

@@ -1492,3 +1492,48 @@ fn an_input_redirect_with_a_descriptor_leaves_stdin_alone() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn a_quoted_star_with_no_positionals_is_one_empty_field() {
+    let expected = "[x][]";
+
+    let (actual, _) = run("set --; printf '[%s]' x \"$*\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_quoted_at_with_no_positionals_is_no_field_at_all() {
+    let expected = "[x]";
+
+    let (actual, _) = run("set --; printf '[%s]' x \"$@\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_quoted_star_joins_its_positionals_into_one_field() {
+    let expected = "[a b]";
+
+    let (actual, _) = run("set -- a b; printf '[%s]' \"$*\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_quoted_star_joins_with_the_first_character_of_ifs() {
+    let expected = "[a:b]";
+
+    let (actual, _) = run("set -- a b; IFS=:; printf '[%s]' \"$*\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn star_with_no_positionals_takes_a_default_word() {
+    let expected = "[fallback]";
+
+    let (actual, _) = run("set --; printf '[%s]' ${*-fallback}");
+
+    assert_eq!(actual, expected);
+}
