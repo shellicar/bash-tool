@@ -1726,3 +1726,32 @@ fn compgen_reports_no_match_without_printing() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn ulimit_reports_the_soft_and_hard_limits() {
+    let (output, status) = run("ulimit -n; ulimit -Hn");
+
+    assert_eq!(status, 0);
+    let mut lines = output.lines();
+    let soft = lines.next().expect("soft limit line");
+    let hard = lines.next().expect("hard limit line");
+    assert!(soft == "unlimited" || soft.parse::<u64>().is_ok(), "{output}");
+    assert!(hard == "unlimited" || hard.parse::<u64>().is_ok(), "{output}");
+}
+
+#[test]
+fn setting_a_ulimit_is_refused_by_name() {
+    let (output, status) = run("ulimit -n 6");
+
+    assert_ne!(status, 0);
+    assert!(output.contains("ulimit: setting a limit is not supported"), "{output}");
+}
+
+#[test]
+fn command_dash_capital_v_describes_a_name_the_way_type_does() {
+    let expected = ("while is a shell keyword\ncd is a shell builtin\n".to_string(), 0);
+
+    let actual = run("command -V while; command -V cd");
+
+    assert_eq!(actual, expected);
+}

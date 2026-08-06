@@ -15,11 +15,11 @@ const NATIVE: &[&str] = &[
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
     "echo", "printf", "exec", "umask", "builtin", "declare", "typeset", "readonly",
     "shopt", "getopts", "type", "hash", "alias", "unalias", "dirs", "pushd", "popd",
-    "compgen",
+    "compgen", "ulimit",
 ];
 
 const UNSUPPORTED: &[&str] = &[
-    "trap", "ulimit",
+    "trap",
     "jobs", "fg", "bg", "help", "history", "disown", "suspend", "times",
     "caller", "enable", "mapfile", "readarray", "complete", "compopt",
 ];
@@ -92,6 +92,7 @@ pub fn run(
         "alias" | "unalias" => alias(ex, ctx, name, args),
         "dirs" | "pushd" | "popd" => dirs(ex, ctx, name, args),
         "compgen" => compgen(ex, ctx, args),
+        "ulimit" => ulimit(ex, ctx, args),
         "read" => read(ex, ctx, args),
         "wait" => {
             // Waiting for every job succeeds; it is `wait PID` that reports the
@@ -1344,6 +1345,82 @@ fn type_builtin(ex: &mut Exec, ctx: &Ctx, verb: &str, args: &[String]) -> Result
         }
     }
     Ok(status)
+}
+
+/// `ulimit` — the reading side. Each letter names a resource and the
+/// divisor bash reports it in.
+const LIMITS: &[(char, libc::c_int, u64)] = &[
+    ('c', libc::RLIMIT_CORE as libc::c_int, 512),
+    ('d', libc::RLIMIT_DATA as libc::c_int, 1024),
+    ('f', libc::RLIMIT_FSIZE as libc::c_int, 512),
+    ('l', libc::RLIMIT_MEMLOCK as libc::c_int, 1024),
+    ('m', libc::RLIMIT_RSS as libc::c_int, 1024),
+    ('n', libc::RLIMIT_NOFILE as libc::c_int, 1),
+    ('s', libc::RLIMIT_STACK as libc::c_int, 1024),
+    ('t', libc::RLIMIT_CPU as libc::c_int, 1),
+    ('u', libc::RLIMIT_NPROC as libc::c_int, 1),
+    ('v', libc::RLIMIT_AS as libc::c_int, 1024),
+];
+
+/// `ulimit [-HS] [-cdflmnstuv]` — reports a limit. Changing one is refused:
+/// the walker runs every stage of a script in one process, so a `setrlimit`
+/// here would reach further than the subshell that asked for it and could
+/// starve the walker itself of the descriptors it is holding.
+fn ulimit(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    let _ = ex;
+    let mut hard = false;
+    let mut which: Option<char> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        for c in a[1..].chars() {
+            match c {
+                'H' => hard = true,
+                'S' => hard = false,
+                'a' => {
+                    return Err(Flow::Fatal(
+                        "ulimit -a: the listing is not supported by bash-walker".into(),
+                    ))
+                }
+                c if LIMITS.iter().any(|(l, _, _)| *l == c) => which = Some(c),
+                other => {
+                    ctx.write_err(&format!(
+                        "bash-walker: ulimit: -{other}: invalid option\nulimit: usage: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]\n"
+                    ));
+                    return Ok(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    if args.len() > i {
+        return Err(Flow::Fatal(
+            "ulimit: setting a limit is not supported by bash-walker".into(),
+        ));
+    }
+    // No resource letter means the file-size limit, bash's default.
+    let letter = which.unwrap_or('f');
+    let (_, resource, divisor) = LIMITS.iter().find(|(l, _, _)| *l == letter).unwrap();
+    // SAFETY: getrlimit only reads, into a value we own.
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(*resource as _, &mut rl) } != 0 {
+        ctx.write_err("bash-walker: ulimit: cannot read limit\n");
+        return Ok(1);
+    }
+    let value = if hard { rl.rlim_max } else { rl.rlim_cur };
+    if value == libc::RLIM_INFINITY {
+        ctx.write_out("unlimited\n");
+    } else {
+        ctx.write_out(&format!("{}\n", value as u64 / divisor));
+    }
+    Ok(0)
 }
 
 /// `compgen [-abekv] [-A action] [-W wordlist] [word]` — the words a
