@@ -414,6 +414,14 @@ pub struct ShellState {
     /// does not actually behave as is refused by the builtin.
     pub shopts: std::collections::BTreeSet<String>,
     pub last_status: i32,
+    /// `hash`: remembered paths for command names, with the hit count bash
+    /// prints. Only what `hash -p` puts there — nothing populates it by
+    /// running a command, because the lookup is the operating system's.
+    pub hashed: std::collections::BTreeMap<String, (String, u32)>,
+    /// The directories under the current one, innermost first. `dirs`
+    /// prints the current directory ahead of these; it is not stored
+    /// twice.
+    pub dirstack: Vec<PathBuf>,
     pub last_background_pid: Option<u32>,
     /// `[[ =~ ]]`'s capture groups: whole match at 0, groups after.
     pub rematch: Vec<String>,
@@ -469,6 +477,8 @@ impl Default for ShellState {
             flags: Flags::default(),
             shopts: Default::default(),
             last_status: 0,
+            hashed: Default::default(),
+            dirstack: Vec::new(),
             last_background_pid: None,
             rematch: Vec::new(),
             pipestatus: vec![0],

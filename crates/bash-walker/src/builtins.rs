@@ -14,13 +14,14 @@ const NATIVE: &[&str] = &[
     "cd", "pwd", "export", "unset", "local", "exit", "return", "break", "continue", "shift",
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
     "echo", "printf", "exec", "umask", "builtin", "declare", "typeset", "readonly",
-    "shopt", "getopts",
+    "shopt", "getopts", "type", "hash", "alias", "unalias", "dirs", "pushd", "popd",
+    "compgen",
 ];
 
 const UNSUPPORTED: &[&str] = &[
-    "alias", "unalias", "trap", "ulimit",
-    "jobs", "fg", "bg", "hash", "type", "help", "history", "disown", "suspend", "times",
-    "caller", "enable", "pushd", "popd", "dirs", "mapfile", "readarray",
+    "trap", "ulimit",
+    "jobs", "fg", "bg", "help", "history", "disown", "suspend", "times",
+    "caller", "enable", "mapfile", "readarray", "complete", "compopt",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -86,6 +87,11 @@ pub fn run(
         "set" => set(ex, ctx, args),
         "shopt" => shopt(ex, ctx, args),
         "getopts" => getopts(ex, ctx, args),
+        "type" => type_builtin(ex, ctx, "type", args),
+        "hash" => hash(ex, ctx, args),
+        "alias" | "unalias" => alias(ex, ctx, name, args),
+        "dirs" | "pushd" | "popd" => dirs(ex, ctx, name, args),
+        "compgen" => compgen(ex, ctx, args),
         "read" => read(ex, ctx, args),
         "wait" => {
             // Waiting for every job succeeds; it is `wait PID` that reports the
@@ -1177,6 +1183,542 @@ fn set(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
     Ok(0)
 }
 
+/// The words bash's parser treats as syntax, which `type` reports as
+/// keywords rather than commands.
+const KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until",
+    "do", "done", "in", "function", "time", "{", "}", "!", "[[", "]]", "coproc",
+];
+
+/// What a name resolves to, innermost first — the order `type -a` prints.
+enum Resolved {
+    Keyword,
+    Function,
+    Builtin,
+    Hashed(String),
+    File(String),
+}
+
+fn resolve(ex: &Exec, name: &str, all: bool) -> Vec<Resolved> {
+    let mut found = Vec::new();
+    if KEYWORDS.contains(&name) {
+        found.push(Resolved::Keyword);
+        if !all {
+            return found;
+        }
+    }
+    if ex.state.funcs.contains_key(name) {
+        found.push(Resolved::Function);
+        if !all {
+            return found;
+        }
+    }
+    if is_builtin(name) {
+        found.push(Resolved::Builtin);
+        if !all {
+            return found;
+        }
+    }
+    if let Some((path, _)) = ex.state.hashed.get(name) {
+        found.push(Resolved::Hashed(path.clone()));
+        if !all {
+            return found;
+        }
+    }
+    for path in executables_named(ex, name, all) {
+        found.push(Resolved::File(path));
+        if !all {
+            break;
+        }
+    }
+    found
+}
+
+/// Every executable of that name on PATH, in PATH order. A name with a
+/// slash in it is a path already and stands or falls on its own.
+fn executables_named(ex: &Exec, name: &str, all: bool) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut out = Vec::new();
+    if name.contains('/') {
+        if let Ok(md) = std::fs::metadata(ex.state.resolve(name)) {
+            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
+                out.push(name.to_string());
+            }
+        }
+        return out;
+    }
+    let Some(path) = ex.state.get_var("PATH") else {
+        return out;
+    };
+    for dir in path.split(':') {
+        let cand = std::path::Path::new(dir).join(name);
+        if let Ok(md) = cand.metadata() {
+            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
+                out.push(cand.to_string_lossy().into_owned());
+                if !all {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `type [-afptP] name ...`, and the same work behind `command -v`/`-V`.
+fn type_builtin(ex: &mut Exec, ctx: &Ctx, verb: &str, args: &[String]) -> Result<i32, Flow> {
+    let mut all = false;
+    let mut kind_only = false;
+    let mut path_only = false;
+    let mut force_path = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        for c in a[1..].chars() {
+            match c {
+                'a' => all = true,
+                't' => kind_only = true,
+                'p' => path_only = true,
+                'P' => {
+                    force_path = true;
+                    path_only = true;
+                }
+                'f' => {}
+                other => {
+                    ctx.write_err(&format!(
+                        "bash-walker: {verb}: -{other}: invalid option\n{verb}: usage: type [-afptP] name [name ...]\n"
+                    ));
+                    return Ok(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    let mut status = 0;
+    for name in &args[i..] {
+        let found = if force_path {
+            executables_named(ex, name, all).into_iter().map(Resolved::File).collect()
+        } else {
+            resolve(ex, name, all)
+        };
+        if found.is_empty() {
+            if !path_only && !kind_only {
+                ctx.write_err(&format!("bash-walker: {verb}: {name}: not found\n"));
+            }
+            status = 1;
+            continue;
+        }
+        for what in &found {
+            match (kind_only, path_only, what) {
+                (true, _, Resolved::Keyword) => ctx.write_out("keyword\n"),
+                (true, _, Resolved::Function) => ctx.write_out("function\n"),
+                (true, _, Resolved::Builtin) => ctx.write_out("builtin\n"),
+                (true, _, Resolved::Hashed(_) | Resolved::File(_)) => ctx.write_out("file\n"),
+                (_, true, Resolved::Hashed(p) | Resolved::File(p)) => {
+                    ctx.write_out(&format!("{p}\n"))
+                }
+                (_, true, _) => {}
+                (_, _, Resolved::Keyword) => {
+                    ctx.write_out(&format!("{name} is a shell keyword\n"))
+                }
+                (_, _, Resolved::Builtin) => {
+                    ctx.write_out(&format!("{name} is a shell builtin\n"))
+                }
+                (_, _, Resolved::Hashed(p)) => {
+                    ctx.write_out(&format!("{name} is hashed ({p})\n"))
+                }
+                (_, _, Resolved::File(p)) => ctx.write_out(&format!("{name} is {p}\n")),
+                (_, _, Resolved::Function) => {
+                    ctx.write_out(&format!("{name} is a function\n"));
+                    return Err(Flow::Fatal(format!(
+                        "{verb} {name}: printing a function definition is not supported by bash-walker"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// `compgen [-abekv] [-A action] [-W wordlist] [word]` — the words a
+/// completion would offer, which is a question about shell state and so is
+/// answerable here even though completion itself never runs.
+fn compgen(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    let mut actions: Vec<String> = Vec::new();
+    let mut wordlist: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        let mut chars = a[1..].chars();
+        while let Some(c) = chars.next() {
+            match c {
+                'a' => actions.push("alias".into()),
+                'b' => actions.push("builtin".into()),
+                'e' => actions.push("export".into()),
+                'k' => actions.push("keyword".into()),
+                'v' => actions.push("variable".into()),
+                'A' | 'W' => {
+                    let inline: String = chars.by_ref().collect();
+                    let value = if inline.is_empty() {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                ctx.write_err(&format!(
+                                    "bash-walker: compgen: -{c}: option requires an argument\n"
+                                ));
+                                return Ok(2);
+                            }
+                        }
+                    } else {
+                        inline
+                    };
+                    if c == 'A' {
+                        actions.push(value);
+                    } else {
+                        wordlist = Some(value);
+                    }
+                }
+                other => {
+                    return Err(Flow::Fatal(format!(
+                        "compgen -{other}: not supported by bash-walker"
+                    )))
+                }
+            }
+        }
+        i += 1;
+    }
+    let prefix = args.get(i).cloned().unwrap_or_default();
+
+    let mut words: Vec<String> = Vec::new();
+    if let Some(list) = wordlist {
+        words.extend(list.split_whitespace().map(str::to_string));
+    }
+    for action in &actions {
+        match action.as_str() {
+            "function" => {
+                let mut names: Vec<String> = ex.state.funcs.keys().cloned().collect();
+                names.sort();
+                words.extend(names);
+            }
+            "builtin" => {
+                let mut names: Vec<String> =
+                    NATIVE.iter().chain(UNSUPPORTED.iter()).map(|s| (*s).to_string()).collect();
+                names.sort();
+                words.extend(names);
+            }
+            "keyword" => words.extend(KEYWORDS.iter().map(|s| (*s).to_string())),
+            "shopt" => {
+                words.extend(crate::state::SHOPT_DEFAULTS.iter().map(|(n, _)| (*n).to_string()))
+            }
+            "setopt" => words.extend(crate::state::SET_OPTIONS.iter().map(|s| (*s).to_string())),
+            "variable" => words.extend(ex.state.visible_names()),
+            "export" => words.extend(
+                ex.state.visible_names().into_iter().filter(|n| ex.state.get_attrs(n).exported),
+            ),
+            // The alias table is always empty; see `alias`.
+            "alias" => {}
+            other => {
+                return Err(Flow::Fatal(format!(
+                    "compgen -A {other}: not supported by bash-walker"
+                )))
+            }
+        }
+    }
+    let matched: Vec<String> = words.into_iter().filter(|w| w.starts_with(&prefix)).collect();
+    if matched.is_empty() {
+        return Ok(1);
+    }
+    let mut out = String::new();
+    for w in matched {
+        out.push_str(&w);
+        out.push('\n');
+    }
+    ctx.write_out(&out);
+    Ok(0)
+}
+
+/// `hash [-lr] [-p path] [-dt] [name ...]`. Nothing fills this table by
+/// running a command — the walker looks a program up through the operating
+/// system every time — so what is in here is what `hash -p` put there.
+fn hash(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    let mut path: Option<String> = None;
+    let mut list = false;
+    let mut delete = false;
+    let mut show_path = false;
+    let mut cleared = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        for c in a[1..].chars() {
+            match c {
+                'r' => {
+                    ex.state.hashed.clear();
+                    cleared = true;
+                }
+                'l' => list = true,
+                'd' => delete = true,
+                't' => show_path = true,
+                'p' => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(p) => path = Some(p.clone()),
+                        None => {
+                            ctx.write_err("bash-walker: hash: -p: option requires an argument\n");
+                            return Ok(2);
+                        }
+                    }
+                }
+                other => {
+                    ctx.write_err(&format!(
+                        "bash-walker: hash: -{other}: invalid option\nhash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n"
+                    ));
+                    return Ok(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    let names = &args[i..];
+    if names.is_empty() {
+        // `hash -r` empties the table and says nothing.
+        if cleared {
+            return Ok(0);
+        }
+        if ex.state.hashed.is_empty() {
+            if !list {
+                ctx.write_out("hash: hash table empty\n");
+            }
+            return Ok(0);
+        }
+        let mut out = String::new();
+        if !list {
+            out.push_str("hits\tcommand\n");
+        }
+        for (name, (p, hits)) in &ex.state.hashed {
+            if list {
+                out.push_str(&format!("builtin hash -p {p} {name}\n"));
+            } else {
+                out.push_str(&format!("{hits:4}\t{p}\n"));
+            }
+        }
+        ctx.write_out(&out);
+        return Ok(0);
+    }
+    let mut status = 0;
+    for name in names {
+        if let Some(p) = &path {
+            ex.state.hashed.insert(name.clone(), (p.clone(), 0));
+            continue;
+        }
+        if delete {
+            if ex.state.hashed.remove(name).is_none() {
+                ctx.write_err(&format!("bash-walker: hash: {name}: not found\n"));
+                status = 1;
+            }
+            continue;
+        }
+        if show_path {
+            match ex.state.hashed.get(name) {
+                Some((p, _)) => {
+                    if names.len() > 1 {
+                        ctx.write_out(&format!("{name}\t{p}\n"));
+                    } else {
+                        ctx.write_out(&format!("{p}\n"));
+                    }
+                }
+                None => {
+                    ctx.write_err(&format!("bash-walker: hash: {name}: not found\n"));
+                    status = 1;
+                }
+            }
+            continue;
+        }
+        match executables_named(ex, name, false).into_iter().next() {
+            Some(p) => {
+                ex.state.hashed.insert(name.clone(), (p, 0));
+            }
+            None => {
+                ctx.write_err(&format!("bash-walker: hash: {name}: not found\n"));
+                status = 1;
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// `alias`/`unalias`. The alias table is always empty here: defining one is
+/// refused by name, because nothing in the walker would ever expand it. The
+/// query and listing forms are exactly right against that empty table.
+fn alias(ex: &mut Exec, ctx: &Ctx, verb: &str, args: &[String]) -> Result<i32, Flow> {
+    let _ = ex;
+    let mut i = 0;
+    let mut all = false;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" if verb == "alias" => {}
+            "-a" if verb == "unalias" => all = true,
+            "--" => {
+                i += 1;
+                break;
+            }
+            a if a.starts_with('-') && a.len() > 1 => {
+                ctx.write_err(&format!(
+                    "bash-walker: {verb}: {a}: invalid option\n{verb}: usage: {verb} [-p] [name[=value] ... ]\n"
+                ));
+                return Ok(2);
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    if all {
+        return Ok(0);
+    }
+    let mut status = 0;
+    for a in &args[i..] {
+        if verb == "alias" && a.contains('=') {
+            return Err(Flow::Fatal(
+                "alias: defining an alias is not supported by bash-walker".into(),
+            ));
+        }
+        ctx.write_err(&format!("bash-walker: {verb}: {a}: not found\n"));
+        status = 1;
+    }
+    Ok(status)
+}
+
+/// `dirs`, `pushd` and `popd` over one stack whose top is always the
+/// current directory.
+fn dirs(ex: &mut Exec, ctx: &Ctx, verb: &str, args: &[String]) -> Result<i32, Flow> {
+    let mut verbose = false;
+    let mut long = false;
+    let mut clear = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        // `+N`/`-N` are stack positions, not options.
+        if !a.starts_with('-') || a.len() < 2 || a[1..].chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        for c in a[1..].chars() {
+            match c {
+                'v' => verbose = true,
+                'l' => long = true,
+                'c' => clear = true,
+                'p' => {}
+                other => {
+                    ctx.write_err(&format!(
+                        "bash-walker: {verb}: -{other}: invalid option\n{verb}: usage: {verb} [-clpv] [+N] [-N]\n"
+                    ));
+                    return Ok(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    let rest = &args[i..];
+    match verb {
+        "dirs" => {
+            if clear {
+                ex.state.dirstack.clear();
+                return Ok(0);
+            }
+            ctx.write_out(&dirstack_listing(ex, verbose, long));
+            Ok(0)
+        }
+        "pushd" => {
+            let Some(target) = rest.first() else {
+                // No argument swaps the top two entries.
+                if ex.state.dirstack.is_empty() {
+                    ctx.write_err("bash-walker: pushd: no other directory\n");
+                    return Ok(1);
+                }
+                let next = ex.state.dirstack.remove(0);
+                let here = ex.state.cwd.clone();
+                ex.state.dirstack.insert(0, here);
+                let st = cd(ex, ctx, &[next.to_string_lossy().into_owned()])?;
+                if st != 0 {
+                    return Ok(st);
+                }
+                ctx.write_out(&dirstack_listing(ex, false, false));
+                return Ok(0);
+            };
+            let here = ex.state.cwd.clone();
+            let st = cd(ex, ctx, &[target.clone()])?;
+            if st != 0 {
+                return Ok(st);
+            }
+            ex.state.dirstack.insert(0, here);
+            ctx.write_out(&dirstack_listing(ex, false, false));
+            Ok(0)
+        }
+        _ => {
+            if ex.state.dirstack.is_empty() {
+                ctx.write_err("bash-walker: popd: directory stack empty\n");
+                return Ok(1);
+            }
+            let next = ex.state.dirstack.remove(0);
+            let st = cd(ex, ctx, &[next.to_string_lossy().into_owned()])?;
+            if st != 0 {
+                return Ok(st);
+            }
+            ctx.write_out(&dirstack_listing(ex, false, false));
+            Ok(0)
+        }
+    }
+}
+
+fn dirstack_listing(ex: &Exec, verbose: bool, long: bool) -> String {
+    let home = ex.state.get_var("HOME").unwrap_or_default();
+    let shorten = |p: &str| -> String {
+        if long || home.is_empty() {
+            return p.to_string();
+        }
+        if p == home {
+            "~".to_string()
+        } else if let Some(rest) = p.strip_prefix(&format!("{home}/")) {
+            format!("~/{rest}")
+        } else {
+            p.to_string()
+        }
+    };
+    let mut all = vec![ex.state.cwd.to_string_lossy().into_owned()];
+    all.extend(ex.state.dirstack.iter().map(|p| p.to_string_lossy().into_owned()));
+    if verbose {
+        let mut out = String::new();
+        for (i, p) in all.iter().enumerate() {
+            out.push_str(&format!("{i:2}  {}\n", shorten(p)));
+        }
+        return out;
+    }
+    format!("{}\n", all.iter().map(|p| shorten(p)).collect::<Vec<_>>().join(" "))
+}
+
 /// `getopts optstring name [arg ...]` — one option per call, with the
 /// scan's position carried in `OPTIND` and in the walker's own record of
 /// how far into the current word it has read.
@@ -1591,7 +2133,10 @@ fn command(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
             let Some(name) = args.get(1) else {
                 return Ok(1);
             };
-            if ex.state.funcs.contains_key(name) || is_builtin(name) {
+            if crate::builtins::KEYWORDS.contains(&name.as_str())
+                || ex.state.funcs.contains_key(name)
+                || is_builtin(name)
+            {
                 ctx.write_out(&format!("{name}\n"));
                 return Ok(0);
             }
@@ -1603,6 +2148,8 @@ fn command(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
                 None => Ok(1),
             }
         }
+        // `command -V` is `type` under another name.
+        Some("-V") => type_builtin(ex, ctx, "command", &args[1..]),
         Some(_) => Err(Flow::Fatal(
             "command (other than -v) is not supported by bash-walker".into(),
         )),

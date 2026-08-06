@@ -1640,3 +1640,89 @@ fn resetting_optind_restarts_the_scan() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn type_names_a_keyword_a_builtin_and_a_file() {
+    let expected = (
+        "while is a shell keyword\ncd is a shell builtin\n/bin/sh is /bin/sh\n".to_string(),
+        0,
+    );
+
+    let actual = run("type while cd /bin/sh");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn type_t_reports_the_kind_and_type_p_only_a_file() {
+    let expected = ("keyword\nbuiltin\nfile\n/bin/sh\n".to_string(), 0);
+
+    let actual = run("type -t while cd /bin/sh; type -p while /bin/sh");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn type_reports_a_name_it_cannot_find() {
+    let (output, _) = run("type notthere; echo st=$?");
+
+    assert!(output.contains("notthere: not found"), "{output}");
+    assert!(output.contains("st=1\n"), "{output}");
+}
+
+#[test]
+fn a_hashed_name_is_reported_as_hashed_and_listed_with_its_hits() {
+    let expected = (
+        "hits\tcommand\n   0\t/bin/sh\nsh is hashed (/bin/sh)\n/bin/sh\nhash: hash table empty\n"
+            .to_string(),
+        0,
+    );
+
+    let actual = run("hash -p /bin/sh sh; hash; type sh; type -p sh; hash -d sh; hash");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn the_directory_stack_pushes_swaps_and_pops() {
+    let expected = ("/tmp\n/usr /tmp\n/tmp /usr\n/usr\n".to_string(), 0);
+
+    let actual = run("cd /tmp; dirs; pushd /usr; pushd; popd");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn popping_an_empty_directory_stack_fails() {
+    let (output, _) = run("popd; echo st=$?");
+
+    assert!(output.contains("directory stack empty"), "{output}");
+    assert!(output.contains("st=1\n"), "{output}");
+}
+
+#[test]
+fn unaliasing_everything_succeeds_and_a_named_alias_is_not_found() {
+    let (output, _) = run("unalias -a; echo a=$?; unalias nope; echo b=$?");
+
+    assert!(output.contains("a=0\n"), "{output}");
+    assert!(output.contains("nope: not found"), "{output}");
+    assert!(output.contains("b=1\n"), "{output}");
+}
+
+#[test]
+fn compgen_generates_the_names_that_match_the_prefix() {
+    let expected = ("f\nfoo\naa\nab\n".to_string(), 0);
+
+    let actual = run("f() { :; }; foo() { :; }; bar() { :; }; compgen -A function f; compgen -W 'aa ab bb' a");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn compgen_reports_no_match_without_printing() {
+    let expected = (String::new(), 1);
+
+    let actual = run("compgen -W 'aa ab' z");
+
+    assert_eq!(actual, expected);
+}
