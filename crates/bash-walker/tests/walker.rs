@@ -1755,3 +1755,107 @@ fn command_dash_capital_v_describes_a_name_the_way_type_does() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn the_exit_trap_runs_at_the_end_and_sees_the_exiting_status() {
+    let expected = ("mid\nexiting 7\n".to_string(), 7);
+
+    let actual = run("trap 'echo exiting $?' EXIT; false; echo mid; exit 7");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn the_exit_trap_runs_when_errexit_ends_the_shell() {
+    let expected = ("bye\n".to_string(), 1);
+
+    let actual = run("set -e; trap 'echo bye' EXIT; false; echo never");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_subshell_runs_its_own_exit_trap_and_never_the_one_around_it() {
+    let expected = ("subshell exit\nend\nt\n".to_string(), 0);
+
+    let actual = run("trap 'echo t' EXIT; ( trap 'echo subshell exit' 0; exit 0 ); ( exit 0 ); echo end");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn an_exit_inside_the_exit_trap_sets_the_status() {
+    let expected = ("0\n".to_string(), 0);
+
+    let actual = run("( set -e; trap 'exit 0' EXIT; false; echo bad ); echo $?");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_command_substitution_runs_its_own_exit_trap_into_the_capture() {
+    let expected = ("body captured-exit\n".to_string(), 0);
+
+    let actual = run("echo $(trap 'echo captured-exit' EXIT; echo body)");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn the_err_trap_fires_exactly_where_errexit_would_act() {
+    let expected = ("ERR 1\na\nERR 3\nERR 5\ndone\n".to_string(), 0);
+
+    let actual = run(
+        "trap 'echo ERR $?' ERR; false; echo a; (exit 3); if false; then :; fi; false || true; g() { return 5; }; g; echo done",
+    );
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_failure_inside_the_err_trap_does_not_fire_it_again() {
+    let expected = ("nested\ndone\n".to_string(), 0);
+
+    let actual = run("trap 'echo nested; false' ERR; false; echo done");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn trap_lists_what_is_set_and_forgets_what_is_reset() {
+    let expected = (
+        "trap -- 'echo hi' EXIT\ntrap -- 'echo hi' ERR\necho hi\ntrap -- 'echo hi' EXIT\ntrap -- '' ERR\ntrap -- '' ERR\n"
+            .to_string(),
+        0,
+    );
+
+    let actual = run("trap 'echo hi' EXIT ERR; trap; trap -P EXIT; trap '' ERR; trap; trap - EXIT; trap");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_trap_on_a_signal_is_refused_by_name() {
+    let (output, status) = run("trap 'echo x' INT");
+
+    assert_ne!(status, 0);
+    assert!(output.contains("signals are not supported by bash-walker"), "{output}");
+}
+
+#[test]
+fn appending_to_an_integer_variable_adds_rather_than_concatenates() {
+    let expected = ("6\n2\nab\n".to_string(), 0);
+
+    let actual = run("declare -i n=5; n+=1; echo $n; declare -i m; m+=2; echo $m; s=a; s+=b; echo $s");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn assigning_to_a_readonly_variable_ends_the_shell() {
+    let (output, status) = run("readonly r=5; r=6; echo never");
+
+    assert_eq!(status, 1);
+    assert!(output.contains("r: readonly variable"), "{output}");
+    assert!(!output.contains("never"), "{output}");
+}

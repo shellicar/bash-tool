@@ -88,6 +88,9 @@ pub struct Shared {
     /// base ctx for the rest of the invocation. Subshells and pipeline
     /// stages save/restore it, so their `exec` does not leak out.
     pub persistent_ctx: Option<Ctx>,
+    /// True while a trap handler is running, so a failure inside an ERR
+    /// handler does not fire the same handler again.
+    pub in_trap: bool,
     pub clock: Arc<dyn crate::clock::Clock + Send + Sync>,
     pub entropy: Arc<dyn crate::clock::Entropy + Send + Sync>,
 }
@@ -102,6 +105,7 @@ impl Default for Shared {
             subst_depth: 0,
             last_capture_status: None,
             persistent_ctx: None,
+            in_trap: false,
             clock: Arc::new(crate::clock::RealClock::default()),
             entropy: Arc::new(crate::clock::RealEntropy),
         }
@@ -157,11 +161,13 @@ impl<'a> Exec<'a> {
         if matches!(cmd, Command::Simple(_)) {
             self.state.pipestatus = vec![status];
         }
-        if status != 0
-            && self.state.flags.errexit
-            && !tested
-            && errexit_eligible(cmd)
-        {
+        // The ERR trap fires exactly where `set -e` would act, which is
+        // bash's own rule: an untested command whose status is its own.
+        let failed_on_its_own = status != 0 && !tested && errexit_eligible(cmd);
+        if failed_on_its_own {
+            run_trap(self, ctx, "ERR", status)?;
+        }
+        if failed_on_its_own && self.state.flags.errexit {
             return Err(Flow::Exit(status));
         }
         Ok(status)
@@ -445,18 +451,27 @@ impl<'a> Exec<'a> {
     fn run_subshell(&mut self, inner: &Command, ctx: &Ctx, tested: bool) -> Result<i32, Flow> {
         let saved_pctx = self.shared.persistent_ctx.clone();
         let mut sub_state = self.state.clone();
+        // A subshell does not inherit the traps around it; one it sets for
+        // itself runs when the subshell ends.
+        sub_state.traps.clear();
         let mut sub = Exec { state: &mut sub_state, shared: &mut *self.shared };
         let r = sub.exec(inner, ctx, tested);
         let capture_status = sub_state.last_status;
-        self.shared.persistent_ctx = saved_pctx;
-        match r {
-            Ok(st) => Ok(st),
-            Err(Flow::Exit(st)) => Ok(st),
+        let status = match r {
+            Ok(st) => st,
+            Err(Flow::Exit(st)) => st,
             // A stray break/continue/return cannot cross a subshell.
-            Err(Flow::Break(_)) | Err(Flow::Continue(_)) => Ok(capture_status),
-            Err(Flow::Return(st)) => Ok(st),
-            Err(f @ (Flow::Fatal(_) | Flow::RedirectFailed(_))) => Err(f),
-        }
+            Err(Flow::Break(_)) | Err(Flow::Continue(_)) => capture_status,
+            Err(Flow::Return(st)) => st,
+            Err(f @ (Flow::Fatal(_) | Flow::RedirectFailed(_))) => {
+                self.shared.persistent_ctx = saved_pctx;
+                return Err(f);
+            }
+        };
+        let mut sub = Exec { state: &mut sub_state, shared: &mut *self.shared };
+        let status = run_exit_trap(&mut sub, ctx, status);
+        self.shared.persistent_ctx = saved_pctx;
+        Ok(status)
     }
 
     fn exec_while(
@@ -813,7 +828,13 @@ impl<'a> Exec<'a> {
         if fields.is_empty() {
             for (k, v) in assigns {
                 self.xtrace_assign(&ctx2, &k, &v);
-                self.state.set_var(&k, v);
+                // An assignment that the variable's attributes refuse is
+                // fatal to a non-interactive shell, exactly as under bash:
+                // nothing after it runs.
+                if let Err(e) = self.state.assign(&k, v) {
+                    ctx2.write_err(&format!("bash-walker: {}\n", assign_error(&k, &e)));
+                    return Err(Flow::Exit(1));
+                }
             }
             return Ok(self.shared.last_capture_status.unwrap_or(0));
         }
@@ -887,7 +908,16 @@ impl<'a> Exec<'a> {
         if !a.append {
             return v;
         }
-        let mut joined = self.state.get_var(&a.name).unwrap_or_default();
+        let existing = self.state.get_var(&a.name).unwrap_or_default();
+        // `+=` on an integer variable adds rather than concatenates. The
+        // sum is left as an expression for the assignment itself to
+        // evaluate, which is where the `-i` attribute is applied.
+        if self.state.get_attrs(&a.name).integer {
+            let left = if existing.trim().is_empty() { "0" } else { existing.as_str() };
+            let right = if v.trim().is_empty() { "0" } else { v.as_str() };
+            return format!("({left})+({right})");
+        }
+        let mut joined = existing;
         joined.push_str(&v);
         joined
     }
@@ -1179,6 +1209,14 @@ impl SpawnSlot {
     }
 }
 
+/// bash's wording for an assignment its attributes refused.
+fn assign_error(name: &str, e: &crate::state::AssignError) -> String {
+    match e {
+        crate::state::AssignError::Readonly => format!("{name}: readonly variable"),
+        crate::state::AssignError::Arith(msg) => msg.clone(),
+    }
+}
+
 /// Whether a non-zero status from this node is the shell's to exit on under
 /// `set -e`. A `;` list is not a command: each element already answered this
 /// question for itself, so judging the list again exits on a status the
@@ -1331,6 +1369,52 @@ fn ansi_c_quote(word: &str) -> String {
     out
 }
 
+/// A trap handler for a condition that has just come up. `status` is what
+/// `$?` reads inside the handler, and what it reads again afterwards: the
+/// handler's own commands do not overwrite it, though an `exit` in it still
+/// exits.
+fn run_trap(ex: &mut Exec, ctx: &Ctx, cond: &str, status: i32) -> Result<(), Flow> {
+    if ex.shared.in_trap {
+        return Ok(());
+    }
+    let Some(action) = ex.state.traps.get(cond).cloned() else {
+        return Ok(());
+    };
+    if action.is_empty() {
+        return Ok(());
+    }
+    ex.state.last_status = status;
+    ex.shared.in_trap = true;
+    let r = run_source(ex, ctx, &action, false);
+    ex.shared.in_trap = false;
+    ex.state.last_status = status;
+    r.map(|_| ())
+}
+
+/// The EXIT trap, at the end of a shell — the invocation itself, or a
+/// subshell. It runs once, and its own `exit N` is the status the shell
+/// then exits with; a command failing inside it changes nothing.
+pub fn run_exit_trap(ex: &mut Exec, ctx: &Ctx, status: i32) -> i32 {
+    let Some(action) = ex.state.traps.remove("EXIT") else {
+        return status;
+    };
+    if action.is_empty() || ex.shared.in_trap {
+        return status;
+    }
+    ex.state.last_status = status;
+    ex.shared.in_trap = true;
+    let r = run_source(ex, ctx, &action, false);
+    ex.shared.in_trap = false;
+    match r {
+        Err(Flow::Exit(st)) | Err(Flow::Return(st)) => st,
+        Err(Flow::Fatal(msg)) | Err(Flow::RedirectFailed(msg)) => {
+            ctx.write_err(&format!("bash-walker: {msg}\n"));
+            status
+        }
+        _ => status,
+    }
+}
+
 /// Parse and execute a source string in the current shell (top level, the
 /// `eval`/`source` builtins, and substitution interiors).
 pub fn run_source(ex: &mut Exec, ctx: &Ctx, src: &str, tested: bool) -> Result<i32, Flow> {
@@ -1365,6 +1449,7 @@ fn run_capture_inner(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow
     // so `x=$(set -e; false; echo bad)` ran on and captured "bad" where bash
     // aborts with an empty capture and status 1.
     sub_state.flags.errexit = false;
+    sub_state.traps.clear();
     let status = {
         let mut sub = Exec { state: &mut sub_state, shared: &mut *ex.shared };
         let sub_ctx = Ctx {
@@ -1374,11 +1459,12 @@ fn run_capture_inner(ex: &mut Exec, ctx: &Ctx, src: &str) -> Result<String, Flow
             fds: ctx.fds.clone(),
             derived: true,
         };
-        match run_source(&mut sub, &sub_ctx, src, false) {
+        let st = match run_source(&mut sub, &sub_ctx, src, false) {
             Ok(st) => st,
             Err(Flow::Exit(st)) => st,
             Err(f) => return Err(f),
-        }
+        };
+        run_exit_trap(&mut sub, &sub_ctx, st)
     };
     ex.shared.persistent_ctx = saved_pctx;
     ex.state.last_status = status;

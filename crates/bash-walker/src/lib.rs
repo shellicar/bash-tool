@@ -76,6 +76,8 @@ pub fn run_with(
         }
     };
 
+    let status = walk::run_exit_trap(&mut ex, &ctx, status);
+
     for path in shared.procsub_temps.drain(..) {
         let _ = std::fs::remove_file(path);
     }
@@ -179,6 +181,7 @@ pub fn run_streaming(
             }
         }
     };
+    let status = walk::run_exit_trap(&mut ex, &ctx, status);
     for path in shared.procsub_temps.drain(..) {
         let _ = std::fs::remove_file(path);
     }

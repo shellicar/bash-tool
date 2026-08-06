@@ -422,6 +422,12 @@ pub struct ShellState {
     /// prints the current directory ahead of these; it is not stored
     /// twice.
     pub dirstack: Vec<PathBuf>,
+    /// Trap actions by condition name, `EXIT` and `ERR` only — an empty
+    /// action means the condition is ignored, and a condition with no entry
+    /// takes its default. A trap on a real signal is refused by the
+    /// builtin, because nothing here installs a handler to deliver it.
+    /// Subshells clear this: bash resets a parent's traps in a child.
+    pub traps: std::collections::BTreeMap<String, String>,
     pub last_background_pid: Option<u32>,
     /// `[[ =~ ]]`'s capture groups: whole match at 0, groups after.
     pub rematch: Vec<String>,
@@ -479,6 +485,7 @@ impl Default for ShellState {
             last_status: 0,
             hashed: Default::default(),
             dirstack: Vec::new(),
+            traps: Default::default(),
             last_background_pid: None,
             rematch: Vec::new(),
             pipestatus: vec![0],

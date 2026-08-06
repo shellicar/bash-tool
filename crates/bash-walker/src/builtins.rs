@@ -15,11 +15,10 @@ const NATIVE: &[&str] = &[
     "set", "read", "wait", "eval", "source", ".", ":", "true", "false", "command", "let",
     "echo", "printf", "exec", "umask", "builtin", "declare", "typeset", "readonly",
     "shopt", "getopts", "type", "hash", "alias", "unalias", "dirs", "pushd", "popd",
-    "compgen", "ulimit",
+    "compgen", "ulimit", "trap",
 ];
 
 const UNSUPPORTED: &[&str] = &[
-    "trap",
     "jobs", "fg", "bg", "help", "history", "disown", "suspend", "times",
     "caller", "enable", "mapfile", "readarray", "complete", "compopt",
 ];
@@ -93,6 +92,7 @@ pub fn run(
         "dirs" | "pushd" | "popd" => dirs(ex, ctx, name, args),
         "compgen" => compgen(ex, ctx, args),
         "ulimit" => ulimit(ex, ctx, args),
+        "trap" => trap(ex, ctx, args),
         "read" => read(ex, ctx, args),
         "wait" => {
             // Waiting for every job succeeds; it is `wait PID` that reports the
@@ -1345,6 +1345,145 @@ fn type_builtin(ex: &mut Exec, ctx: &Ctx, verb: &str, args: &[String]) -> Result
         }
     }
     Ok(status)
+}
+
+/// The conditions the walker can actually raise. A real signal is not one
+/// of them: no handler is installed here, so a trap on `INT` would be a
+/// promise the walker could not keep.
+const TRAP_CONDITIONS: &[&str] = &["EXIT", "ERR"];
+
+/// The canonical name for a trap condition, or None when the walker cannot
+/// raise it. `0` is `EXIT`, and a `SIG` prefix is optional.
+fn trap_condition(spec: &str) -> Option<String> {
+    let upper = spec.to_uppercase();
+    let bare = upper.strip_prefix("SIG").unwrap_or(&upper);
+    if bare == "0" {
+        return Some("EXIT".to_string());
+    }
+    TRAP_CONDITIONS.contains(&bare).then(|| bare.to_string())
+}
+
+/// `trap [-Plp] [[action] condition ...]`.
+fn trap(ex: &mut Exec, ctx: &Ctx, args: &[String]) -> Result<i32, Flow> {
+    const USAGE: &str = "trap: usage: trap [-Plp] [[action] signal_spec ...]\n";
+    let mut print = false;
+    let mut action_only = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        for c in a[1..].chars() {
+            match c {
+                'p' => print = true,
+                'P' => action_only = true,
+                'l' => {
+                    return Err(Flow::Fatal(
+                        "trap -l: the signal list is not supported by bash-walker".into(),
+                    ))
+                }
+                other => {
+                    ctx.write_err(&format!(
+                        "bash-walker: trap: -{other}: invalid option\n{USAGE}"
+                    ));
+                    return Ok(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    if print && action_only {
+        ctx.write_err("bash-walker: trap: cannot specify both -p and -P\n");
+        return Ok(2);
+    }
+    let rest = &args[i..];
+
+    // Listing: everything, or just the conditions named.
+    if rest.is_empty() || print || action_only {
+        let mut out = String::new();
+        let named: Vec<String> = rest.to_vec();
+        for cond in TRAP_CONDITIONS {
+            let Some(action) = ex.state.traps.get(*cond) else {
+                continue;
+            };
+            if !named.is_empty()
+                && !named.iter().any(|n| trap_condition(n).as_deref() == Some(cond))
+            {
+                continue;
+            }
+            if action_only {
+                out.push_str(&format!("{action}\n"));
+            } else {
+                out.push_str(&format!("trap -- '{action}' {cond}\n"));
+            }
+        }
+        ctx.write_out(&out);
+        return Ok(0);
+    }
+
+    // `trap CONDITION` on its own resets that condition, which is why the
+    // first word is only an action when more words follow it.
+    let (action, conditions): (Option<&str>, &[String]) = if rest.len() == 1 {
+        match trap_condition(&rest[0]) {
+            Some(_) => (None, rest),
+            None => {
+                ctx.write_err(USAGE);
+                return Ok(2);
+            }
+        }
+    } else {
+        (Some(rest[0].as_str()), &rest[1..])
+    };
+
+    let mut status = 0;
+    for spec in conditions {
+        let Some(cond) = trap_condition(spec) else {
+            if signal_name(spec) {
+                return Err(Flow::Fatal(format!(
+                    "trap on {spec}: signals are not supported by bash-walker, which installs no handler to deliver one"
+                )));
+            }
+            ctx.write_err(&format!(
+                "bash-walker: trap: {spec}: invalid signal specification\n"
+            ));
+            status = 1;
+            continue;
+        };
+        match action {
+            // `trap - COND` and a bare `trap COND` restore the default.
+            None | Some("-") => {
+                ex.state.traps.remove(&cond);
+            }
+            Some(a) => {
+                ex.state.traps.insert(cond, a.to_string());
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// Whether a spec names a real signal (or `DEBUG`/`RETURN`), as opposed to
+/// being a typo. Both are refused, but for different reasons and with
+/// different words.
+fn signal_name(spec: &str) -> bool {
+    let upper = spec.to_uppercase();
+    let bare = upper.strip_prefix("SIG").unwrap_or(&upper);
+    if let Ok(n) = bare.parse::<u32>() {
+        return (1..=64).contains(&n);
+    }
+    matches!(
+        bare,
+        "HUP" | "INT" | "QUIT" | "ILL" | "TRAP" | "ABRT" | "EMT" | "FPE" | "KILL" | "BUS"
+            | "SEGV" | "SYS" | "PIPE" | "ALRM" | "TERM" | "URG" | "STOP" | "TSTP" | "CONT"
+            | "CHLD" | "CLD" | "TTIN" | "TTOU" | "IO" | "XCPU" | "XFSZ" | "VTALRM" | "PROF"
+            | "WINCH" | "INFO" | "USR1" | "USR2" | "POLL" | "PWR" | "STKFLT" | "UNUSED"
+            | "DEBUG" | "RETURN"
+    )
 }
 
 /// `ulimit` — the reading side. Each letter names a resource and the
