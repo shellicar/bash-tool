@@ -40,6 +40,52 @@ Work happens in parallel across several worktrees of this repo, so
 `conformance-baseline.json` conflicts on every merge and is derived state:
 regenerate it with `--accept` after merging rather than resolving it.
 
+## A script must account for its own lifetime
+
+Every script owns what it spawns. Before it is finished you have to be able to
+say three things about it: what it starts, what of that can outlive it, and what
+a Ctrl-C at each distinct stage of its run leaves behind. A script that starts
+containers or long-running children and dies without cleaning up is not
+finished, however correct its happy path. `tools/conformance.mjs` drives
+containers, so this is its rule as much as anything in the consuming rig.
+
+The evidence, from that rig: a 120-second timeout killed its `replay_setup.mjs`
+mid-run and left 48 replay containers running for six hours. The replay it
+spawns handles interruption correctly by itself; the script sitting in front of
+it does not, so the careful handling underneath was bypassed entirely. A wrapper
+inherits none of its child's discipline.
+
+Ctrl-C has three stages, and each is a different promise.
+
+1. **Drain.** Stop taking new work, and let what is in flight finish and be
+   recorded. Say how much is still running and that a second Ctrl-C abandons it.
+2. **Abandon.** Terminate the children, remove what they created, and do not
+   exit until that is done. Report progress while removing: a silent stage here
+   is what makes someone press Ctrl-C again.
+3. **Escape.** Exit non-zero immediately, printing what is being abandoned and
+   the exact command that removes it. This stage exists because stage 2 can
+   itself wedge on a hung daemon, and without it the only way out is a SIGKILL
+   from another terminal — a bigger hammer, aimed with less information.
+
+Two things shape any implementation of that.
+
+**Children reaped is not the guarantee; containers gone is.** Killing a
+`docker run` client does not stop the container, so `--rm` never fires and the
+container keeps running with nothing attached to it. Stage 2 is finished when
+`docker ps` says so, not when the child processes are dead.
+
+**Ctrl-C reaches every process in the terminal's process group**, so children
+get it at the same instant the parent does. A child taking the default action
+dies holding its containers before the parent can drain anything. The parent has
+to be the only one acting on the signal: children ignore SIGINT and are stopped
+by the parent.
+
+And the limit of all of it: no handler survives SIGKILL, which is what a harness
+timeout may well send. So the residue also has to be identifiable from outside
+the dead process — deterministic container names or labels carrying the run's
+identity — with the command that sweeps them printed at startup, while the
+script can still print anything at all.
+
 ## Correctness is bash
 
 Bash is the specification. If bash does it, this does it. Nobody working here
