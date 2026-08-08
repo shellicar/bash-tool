@@ -17,16 +17,15 @@ tree can be read, gated by policy, and then executed as-is.
 
 ```sh
 cargo test --workspace          # the unit and behavioural suites
+docker compose build            # the conformance world, once
 node tools/conformance.mjs      # GNU Bash's own 83 test files, as a ratchet
 ```
 
-The conformance run needs a real bash 5.3 built at `~/repos/gnu/bash`, and its
-three test helpers built beside the tests, or fourteen files fail for a reason
-that is about neither shell:
-
-```sh
-cc -o tests/recho support/recho.c      # same for zecho and printenv
-```
+The conformance run happens inside a container so both shells share one GNU
+userland; `compose.yaml` builds it. It needs GNU Bash's source at
+`~/repos/gnu/bash`, or `BASH_SRC` pointing elsewhere, and builds bash, its three
+test helpers and every locale the tests ask for itself. It runs as a normal user
+because several of bash's own files refuse to run as root.
 
 The replay in the consuming rig mounts a Linux binary, cross-built in a
 container so no toolchain is needed on the host:
@@ -40,6 +39,52 @@ Work happens in parallel across several worktrees of this repo, so
 `tools/conformance.mjs --walker PATH` points the gate at a specific build.
 `conformance-baseline.json` conflicts on every merge and is derived state:
 regenerate it with `--accept` after merging rather than resolving it.
+
+## A script must account for its own lifetime
+
+Every script owns what it spawns. Before it is finished you have to be able to
+say three things about it: what it starts, what of that can outlive it, and what
+a Ctrl-C at each distinct stage of its run leaves behind. A script that starts
+containers or long-running children and dies without cleaning up is not
+finished, however correct its happy path. `tools/conformance.mjs` drives
+containers, so this is its rule as much as anything in the consuming rig.
+
+The evidence, from that rig: a 120-second timeout killed its `replay_setup.mjs`
+mid-run and left 48 replay containers running for six hours. The replay it
+spawns handles interruption correctly by itself; the script sitting in front of
+it does not, so the careful handling underneath was bypassed entirely. A wrapper
+inherits none of its child's discipline.
+
+Ctrl-C has three stages, and each is a different promise.
+
+1. **Drain.** Stop taking new work, and let what is in flight finish and be
+   recorded. Say how much is still running and that a second Ctrl-C abandons it.
+2. **Abandon.** Terminate the children, remove what they created, and do not
+   exit until that is done. Report progress while removing: a silent stage here
+   is what makes someone press Ctrl-C again.
+3. **Escape.** Exit non-zero immediately, printing what is being abandoned and
+   the exact command that removes it. This stage exists because stage 2 can
+   itself wedge on a hung daemon, and without it the only way out is a SIGKILL
+   from another terminal — a bigger hammer, aimed with less information.
+
+Two things shape any implementation of that.
+
+**Children reaped is not the guarantee; containers gone is.** Killing a
+`docker run` client does not stop the container, so `--rm` never fires and the
+container keeps running with nothing attached to it. Stage 2 is finished when
+`docker ps` says so, not when the child processes are dead.
+
+**Ctrl-C reaches every process in the terminal's process group**, so children
+get it at the same instant the parent does. A child taking the default action
+dies holding its containers before the parent can drain anything. The parent has
+to be the only one acting on the signal: children ignore SIGINT and are stopped
+by the parent.
+
+And the limit of all of it: no handler survives SIGKILL, which is what a harness
+timeout may well send. So the residue also has to be identifiable from outside
+the dead process — deterministic container names or labels carrying the run's
+identity — with the command that sweeps them printed at startup, while the
+script can still print anything at all.
 
 ## Correctness is bash
 
@@ -168,6 +213,60 @@ header is not, so that reproduces on a Mac and nothing at all in a container.
 The consequence that matters: the conformance suite drives the walker by script
 path, so that gate structurally cannot see this. The two modes it does not test
 are the two the tool is actually used through.
+
+It is also what blocks `nquote4`, and that is where it will surface next.
+`\x{...}` inside `$'...'` yields a BYTE rather than a codepoint: bash masks the
+accumulated value with 0xFF (lib/sh/strtrans.c), so `$'\x{01234567}'` is `g`
+and `$'\x{cd}'` is the single byte 0xCD. Six of that test's eighteen lines
+produce bytes above 0x7F, which a `String` holds as two bytes of UTF-8 against
+bash's one. The decoding itself is right as of e895394 (the braced form, `\x`
+keeping its backslash when no digits follow, and a NUL ending the segment while
+the word carries on); only the representation is left, so the test cannot close
+until this does.
+
+**Collating symbols and equivalence classes in patterns (2026-08-05).**
+`[[.a.]]` and `[[=b=]]` inside a bracket expression are locale-collation
+features, so there is no translation to a plain range: the answer depends on the
+locale's collation table. Supporting them means replacing the matcher, and the
+matcher is used by `case`, `[[ == ]]`, `${x#pat}`, `${x%pat}`, `${x/a/b}` and
+pathname expansion, so every one of those is in scope for regression. Declined
+for constructs almost nobody writes. `posixpat` needs them, so it stays failed.
+
+POSIX character classes are the other half of that test and are NOT declined.
+They are a small, safe fix that has not been done yet. The `glob` crate handles
+bracket expressions correctly but does not know the twelve class names, and it
+does not error on them, it silently matches nothing: `[[:xdigit:]]` against `e`
+returns false where `[0-9a-fA-F]` returns true. So `case e in [[:xdigit:]])`
+quietly takes the wrong branch today, which is the silent-wrong class this
+project exists to remove. The fix is a translation table over the twelve names,
+applied to the pattern before it reaches the matcher. It is low risk because the
+only patterns whose behaviour changes are ones that match nothing today. It is
+ASCII and the C locale only, which is a limitation to write down rather than a
+reason not to do it.
+
+**Extglob outside `[[ ]]`, deferred not declined (2026-08-05).** `shopt -s
+extglob` on one line changes how a later line parses, because bash parses and
+executes a script one command at a time. We parse the whole script up front, so
+the `shopt` cannot reach the lexer, and `?(` `*(` `+(` `@(` `!(` are never word
+syntax outside `[[ ]]`, where they are unconditional because bash makes them so.
+
+Two of bash's tests, `extglob` and `printf`, need it. Note that `bash -n`
+rejects both files too, for the same reason, so this is not the walker being
+worse than bash at reading a file: it is the difference between parsing a script
+and running one.
+
+Closing it means always treating those five as word syntax, which accepts
+slightly more than bash-with-extglob-off does. That is a small lexer change and
+a change to what we support, so it needs the SC. Deferred on 2026-08-05 as not
+understood well enough to decide, not declined.
+
+**Brace expansion's remaining cases (2026-08-05).** Bash does not re-scan
+expansion output for substitutions but does quote-remove it, so `{a..A}` yields
+a literal backtick the walker reads as a substitution opener and a literal
+backslash bash's quote removal eats. Matching it means the expander telling text
+that came out of an expansion apart from text the parser saw, which is a
+provenance change wanting a design rather than a fix at the edges. Parked. The
+same defect is behind `"${a+'$('\'}"`.
 
 **Arrays.** Unimplemented, and half-silent: subscripts refuse loudly, but
 `arr=(a b c)` is accepted and stores the literal text, so `$arr` gives

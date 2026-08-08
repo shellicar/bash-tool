@@ -1559,3 +1559,111 @@ fn uid_expands_to_the_real_user_id() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn case_modification_raises_every_character_its_pattern_matches() {
+    let expected = "hEllO\n";
+
+    let (actual, _) = run("v=hello; echo ${v^^[aeiou]}");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn case_modification_leaves_a_first_character_its_pattern_misses() {
+    let expected = "hello\n";
+
+    let (actual, _) = run("v=hello; echo ${v^[aeiou]}");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_quoted_brace_does_not_end_a_braced_expansion() {
+    let expected = "[}]\n";
+
+    let (actual, _) = run("unset x; echo [${x:-'}'}]");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_hex_escape_with_no_digits_keeps_its_backslash() {
+    let expected = "\\xzz\n";
+
+    let (actual, _) = run("echo $'\\xzz'");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_braced_hex_escape_is_the_last_two_digits_of_what_it_holds() {
+    let expected = "gX\n";
+
+    let (actual, _) = run("echo $'\\x{01234567}X'");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_nul_ends_the_ansi_c_segment_and_the_word_carries_on() {
+    let expected = "abd\n";
+
+    let (actual, _) = run("echo a$'b\\x{}c'd");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn an_input_redirect_with_a_descriptor_leaves_stdin_alone() {
+    let expected = "done\n";
+
+    let (actual, _) = run("cat </dev/null 3</etc/hosts; echo done");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_quoted_star_with_no_positionals_is_one_empty_field() {
+    let expected = "[x][]";
+
+    let (actual, _) = run("set --; printf '[%s]' x \"$*\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_quoted_at_with_no_positionals_is_no_field_at_all() {
+    let expected = "[x]";
+
+    let (actual, _) = run("set --; printf '[%s]' x \"$@\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_quoted_star_joins_its_positionals_into_one_field() {
+    let expected = "[a b]";
+
+    let (actual, _) = run("set -- a b; printf '[%s]' \"$*\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_quoted_star_joins_with_the_first_character_of_ifs() {
+    let expected = "[a:b]";
+
+    let (actual, _) = run("set -- a b; IFS=:; printf '[%s]' \"$*\"");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn star_with_no_positionals_takes_a_default_word() {
+    let expected = "[fallback]";
+
+    let (actual, _) = run("set --; printf '[%s]' ${*-fallback}");
+
+    assert_eq!(actual, expected);
+}

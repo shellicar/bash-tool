@@ -122,6 +122,10 @@ pub fn expand_textual(ex: &mut Exec, ctx: &Ctx, raw: &str) -> Result<String, Flo
                 match text {
                     Expanded::One(s) => out.push_str(&s),
                     Expanded::Many(fields) => out.push_str(&fields.join(" ")),
+                    Expanded::Star(fields) => {
+                        let sep = ifs_first(ex);
+                        out.push_str(&fields.join(&sep));
+                    }
                     Expanded::NotSpecial => {
                         out.push(b[i] as char);
                         i += 1;
@@ -522,6 +526,15 @@ fn range_alternatives(inner: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// What `$*` joins with: IFS's first character, a space when IFS is unset, and
+/// nothing at all when IFS is set to the empty string.
+fn ifs_first(ex: &Exec) -> String {
+    match ex.state.get_var("IFS") {
+        None => " ".to_string(),
+        Some(ifs) => ifs.chars().next().map(String::from).unwrap_or_default(),
+    }
+}
+
 fn single_char(s: &str) -> Option<char> {
     let mut it = s.chars();
     let c = it.next()?;
@@ -530,8 +543,12 @@ fn single_char(s: &str) -> Option<char> {
 
 enum Expanded {
     One(String),
-    /// `$@`/`$*`: pre-separated values (the caller decides field breaks).
+    /// `$@`: one field per value (the caller decides the breaks).
     Many(Vec<String>),
+    /// `$*`: the same values, but joined by IFS's first character into a
+    /// single field when quoted. The two are not interchangeable: `"$*"` with
+    /// no positionals is one EMPTY field where `"$@"` is no field at all.
+    Star(Vec<String>),
     /// The `$` was not a live expansion (e.g. `$` at end of word).
     NotSpecial,
 }
@@ -606,6 +623,13 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                                     }
                                     i = next;
                                 }
+                                // `"$*"`: one field however many values there
+                                // are, so an empty list gives an empty field
+                                // and is never suppressed the way `"$@"` is.
+                                (Expanded::Star(vals), next) => {
+                                    lit.push_str(&vals.join(&ifs_first(ex)));
+                                    i = next;
+                                }
                                 (Expanded::NotSpecial, _) => {
                                     lit.push(b[i] as char);
                                     i += 1;
@@ -672,6 +696,18 @@ fn expand_items(ex: &mut Exec, ctx: &Ctx, raw: &str, split: bool) -> Result<Vec<
                         } else {
                             items.push(Item::Text { s: v.clone(), quoted: false });
                         }
+                    }
+                    i = next;
+                }
+                // Unquoted `$*` joins first and splits after, which is why it
+                // looks like `$@` under a default IFS and stops looking like
+                // it under `IFS=:`.
+                (Expanded::Star(vals), next) => {
+                    let joined = vals.join(&ifs_first(ex));
+                    if split {
+                        push_split(&mut items, &joined, ex);
+                    } else {
+                        items.push(Item::Text { s: joined, quoted: false });
                     }
                     i = next;
                 }
@@ -797,14 +833,37 @@ fn ansi_c_quote(raw: &str, quote_start: usize) -> (String, usize) {
                 b'e' => ('\x1b', 2),
                 b'f' => ('\x0c', 2),
                 b'v' => ('\x0b', 2),
+                // `\x{...}` takes any number of hex digits and an optional
+                // closing brace. Bash masks the accumulated value with 0xFF
+                // either way (lib/sh/strtrans.c), so the result is one BYTE
+                // and the last two digits are the whole of it: `\x{01234567}`
+                // is 'g'. `\x{}` is therefore a NUL. Above 0x7F this is where
+                // the parked byte-representation gap bites, since a Rust
+                // String holds a codepoint and bash holds the raw byte.
                 b'x' => {
-                    let hex: String = raw[i + 2..]
+                    let braced = raw.as_bytes().get(i + 2) == Some(&b'{');
+                    let start = if braced { i + 3 } else { i + 2 };
+                    let digits: String = raw[start..]
                         .chars()
                         .take_while(|c| c.is_ascii_hexdigit())
-                        .take(2)
+                        .take(if braced { usize::MAX } else { 2 })
                         .collect();
-                    let v = u8::from_str_radix(&hex, 16).unwrap_or(b'x');
-                    (v as char, 2 + hex.len())
+                    // `\x` with no digits at all keeps its backslash, so the
+                    // `x` falls through as ordinary text on the next pass.
+                    if !braced && digits.is_empty() {
+                        out.push('\\');
+                        i += 1;
+                        continue;
+                    }
+                    let v = digits
+                        .chars()
+                        .fold(0u32, |acc, c| (acc << 4) | c.to_digit(16).unwrap_or(0))
+                        & 0xFF;
+                    let mut used = (start - i) + digits.len();
+                    if braced && raw[start + digits.len()..].starts_with('}') {
+                        used += 1;
+                    }
+                    (char::from_u32(v).unwrap_or('\0'), used)
                 }
                 // `\nnn` is up to three octal digits, and `\0` is only NUL
                 // because zero digits follow it. Treating `\0` as its own
@@ -823,6 +882,12 @@ fn ansi_c_quote(raw: &str, quote_start: usize) -> (String, usize) {
             out.push('\\');
             i += 1;
         }
+    }
+    // A NUL ends the segment. Bash builds the value as C text, so `$'ab\x{}cd'`
+    // is "ab", and the rest of the WORD carries on after it: `a$'b\x{}c'd` is
+    // "abd".
+    if let Some(nul) = out.find('\0') {
+        out.truncate(nul);
     }
     (out, i + 1)
 }
@@ -883,12 +948,43 @@ fn matched_paren(b: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// The `}` that closes the `${` at `open`. Counting depth alone ends the span
+/// on a quoted brace: `"${x:-'}'}"` closed at the one inside the quotes and
+/// left `'}` as text. The quote arms are the same ones `matched_paren` carries,
+/// and the pair have to keep agreeing: this is the third file the same scanner
+/// defect has appeared in.
 fn matched_brace(b: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0;
     let mut i = open;
     while i < b.len() {
         match b[i] {
             b'\\' => i += 1,
+            // `$'...'` escapes its own quote, so `\'` inside it is a literal
+            // and does not end the span.
+            b'$' if i + 1 < b.len() && b[i + 1] == b'\'' => {
+                i += 2;
+                while i < b.len() && b[i] != b'\'' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'\'' => {
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;
@@ -988,7 +1084,8 @@ fn param_lookup(ex: &mut Exec, name: &str) -> Option<Expanded> {
         "$" => Some(std::process::id().to_string()),
         "!" => ex.state.last_background_pid.map(|p| p.to_string()),
         "#" => Some(ex.state.positional.len().to_string()),
-        "@" | "*" => return Some(Expanded::Many(ex.state.positional.clone())),
+        "@" => return Some(Expanded::Many(ex.state.positional.clone())),
+        "*" => return Some(Expanded::Star(ex.state.positional.clone())),
         "-" => Some(ex.state.flags.option_letters()),
         "0" => Some(ex.state.script_name.clone()),
         // The pid of the shell itself. Bash re-evaluates it per subshell; this
@@ -1100,9 +1197,21 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
             "${{{inner}}}: arrays are not supported by bash-walker"
         )));
     }
+    // `${*-word}` and its family read `$*` as its joined value, and as unset
+    // when there are no positionals at all. Every other operator on $@/$* acts
+    // per element instead, which is a different shape and still refused.
+    let substitutes = matches!(op.as_bytes().first(), Some(b'-' | b'+' | b'?'))
+        || (op.starts_with(':') && matches!(op.as_bytes().get(1), Some(b'-' | b'+' | b'?')));
     let current = match param_lookup(ex, name) {
         Some(Expanded::One(v)) => Some(v),
-        Some(many @ Expanded::Many(_)) => {
+        Some(Expanded::Star(vals)) if substitutes && !op.is_empty() => {
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.join(&ifs_first(ex)))
+            }
+        }
+        Some(many @ (Expanded::Many(_) | Expanded::Star(_))) => {
             if op.is_empty() {
                 return Ok(many);
             }
@@ -1244,25 +1353,42 @@ fn expand_braced_param(ex: &mut Exec, ctx: &Ctx, inner: &str) -> Result<Expanded
         return Ok(Expanded::One(chars[start..end.max(start)].iter().collect()));
     }
 
-    // ${x^^} ${x,,} ${x^} ${x,}
-    match op {
-        "^^" => return Ok(Expanded::One(value.to_uppercase())),
-        ",," => return Ok(Expanded::One(value.to_lowercase())),
-        "^" => {
-            let mut cs = value.chars();
-            return Ok(Expanded::One(match cs.next() {
-                Some(c) => c.to_uppercase().collect::<String>() + cs.as_str(),
-                None => value,
-            }));
+    // ${x^^pat} ${x,,pat} ${x^pat} ${x,pat}. The pattern is optional and
+    // matched against one character at a time, so `${v^^[aeiou]}` raises the
+    // vowels and leaves everything else. Absent, every character matches.
+    for (marker, all, upper) in [("^^", true, true), (",,", true, false), ("^", false, true), (",", false, false)] {
+        let Some(pat) = op.strip_prefix(marker) else {
+            continue;
+        };
+        let matches: Box<dyn Fn(char) -> bool> = if pat.is_empty() {
+            Box::new(|_| true)
+        } else {
+            let pat = word_of(ex, pat)?;
+            let g = glob::Pattern::new(&pat)
+                .map_err(|e| Flow::Fatal(format!("bad pattern {pat:?}: {e}")))?;
+            Box::new(move |c: char| g.matches(&c.to_string()))
+        };
+        let convert = |c: char| -> String {
+            if upper {
+                c.to_uppercase().collect()
+            } else {
+                c.to_lowercase().collect()
+            }
+        };
+        let mut out = String::new();
+        let mut done = false;
+        for c in value.chars() {
+            if (all || !done) && matches(c) {
+                out.push_str(&convert(c));
+                done = true;
+            } else {
+                out.push(c);
+                if !all {
+                    done = true;
+                }
+            }
         }
-        "," => {
-            let mut cs = value.chars();
-            return Ok(Expanded::One(match cs.next() {
-                Some(c) => c.to_lowercase().collect::<String>() + cs.as_str(),
-                None => value,
-            }));
-        }
-        _ => {}
+        return Ok(Expanded::One(out));
     }
 
     Err(Flow::Fatal(format!(

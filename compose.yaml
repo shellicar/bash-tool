@@ -1,0 +1,15 @@
+# The conformance suite's fixed world, so building it is a file rather than a
+# remembered command:
+#
+#   docker compose build
+#
+# The build context is GNU Bash's source tree, which lives outside this repo and
+# at a different depth depending on whether this is the standalone clone or the
+# rig's submodule, so it comes from BASH_SRC rather than a relative path.
+services:
+  conformance:
+    image: bash-conformance
+    platform: linux/amd64
+    build:
+      context: ${BASH_SRC:-${HOME}/repos/gnu/bash}
+      dockerfile: ${PWD}/tools/conformance.Dockerfile

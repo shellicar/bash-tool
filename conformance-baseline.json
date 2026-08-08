@@ -67,7 +67,7 @@
  "quotearray": "unimplemented",
  "read": "unimplemented",
  "redir": "unimplemented",
- "rhs-exp": "unimplemented",
+ "rhs-exp": "divergence",
  "rsh": "unimplemented",
  "set-e": "unimplemented",
  "set-x": "unimplemented",

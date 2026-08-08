@@ -12,8 +12,23 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends gcc make libc6-dev ca-certificates autoconf \
+ && apt-get install -y --no-install-recommends gcc make libc6-dev ca-certificates autoconf locales \
  && rm -rf /var/lib/apt/lists/*
+
+# Every locale bash's own tests ask for, found by sweeping tests/ for locale
+# names. Without them the locale-sensitive files warn and skip on both shells
+# at once, which is a false match rather than a false failure: the gate calls
+# it a pass and nothing was compared.
+RUN printf '%s\n' \
+      'en_US.UTF-8 UTF-8' \
+      'de_DE.UTF-8 UTF-8' \
+      'fr_FR.ISO-8859-1 ISO-8859-1' \
+      'ja_JP.SJIS SHIFT_JIS' \
+      'ru_RU.CP1251 CP1251' \
+      'zh_TW.BIG5 BIG5' \
+      'zh_HK.BIG5-HKSCS BIG5-HKSCS' \
+      > /etc/locale.gen \
+ && locale-gen
 
 COPY . /src
 WORKDIR /src
@@ -40,5 +55,13 @@ RUN (make distclean || true) \
 RUN cc -o tests/recho support/recho.c \
  && cc -o tests/zecho support/zecho.c \
  && cc -o tests/printenv support/printenv.c
+
+# Bash's own tests refuse to run as root: several call the suite off with "the
+# test suite should not be run as root". That hits both shells equally so the
+# comparison stays fair, but those files then measure almost nothing. The tests
+# write into their own directory as well as TMPDIR, so the tree is handed over
+# with them.
+RUN useradd --create-home --uid 1000 tester && chown -R tester /src
+USER tester
 
 WORKDIR /src/tests
