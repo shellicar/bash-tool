@@ -1385,6 +1385,136 @@ fn ansi_c_quoting_survives_inside_a_command_substitution() {
     assert_eq!(actual, expected);
 }
 
+
+/// `|&` is bash's shorthand for `2>&1 |`, so the producer's stderr reaches
+/// the consumer's stdin rather than the terminal.
+#[test]
+fn pipe_ampersand_sends_stderr_down_the_pipe() {
+    let expected = "boom\n";
+
+    let (actual, _) = run("bash-walker-no-such-cmd 2>/dev/null; { echo boom >&2; } |& cat");
+
+    assert_eq!(actual, expected);
+}
+
+/// A pipeline may be empty after `!`. bash exits 1 for a bare `!` and 0 for
+/// `! !`, and both were parse errors here.
+#[test]
+fn a_bang_with_no_pipeline_inverts_success() {
+    let expected = (1, 0);
+
+    let actual = (run("!").1, run("! !").1);
+
+    assert_eq!(actual, expected);
+}
+
+/// `for ((...)) { list; }` is the brace body form; bash accepts it only for
+/// the arithmetic `for`.
+#[test]
+fn arith_for_runs_a_brace_body() {
+    let expected = "0\n1\n2\n";
+
+    let (actual, _) = run("for ((i=0; i<3; i++)) { echo $i; }");
+
+    assert_eq!(actual, expected);
+}
+
+/// Inside `[[ ]]` bash reads `(` and `)` as tokens of their own, so the
+/// grouping needs no surrounding spaces.
+#[test]
+fn cond_parens_need_no_surrounding_spaces() {
+    let expected = "grouped\n";
+
+    let (actual, _) = run("[[ (-n a) && (1 -eq 1) ]] && echo grouped");
+
+    assert_eq!(actual, expected);
+}
+
+/// A function name is any word bash did not lex as an assignment, which
+/// includes `-`, `.` and a leading digit.
+#[test]
+fn a_function_name_may_hold_a_dash() {
+    let expected = "called\n";
+
+    let (actual, _) = run("foo-a() { echo called; }; foo-a");
+
+    assert_eq!(actual, expected);
+}
+
+/// `>|` overrides noclobber, which the walker refuses outright, so it can
+/// only ever behave as a plain `>`.
+#[test]
+fn clobbering_redirect_writes_the_file() {
+    let expected = "hi\n";
+
+    let (actual, _) = run("echo hi >| /tmp/walker-clobber && cat /tmp/walker-clobber");
+
+    assert_eq!(actual, expected);
+}
+
+
+/// `<>` opens for reading and writing without truncating, so a write lands
+/// over the start of the file and leaves the rest. bash prints `abIGINAL`.
+#[test]
+fn read_write_redirect_overwrites_in_place_without_truncating() {
+    let expected = "abIGINAL\n";
+    let path = "/tmp/walker-readwrite";
+    std::fs::write(path, "ORIGINAL\n").unwrap();
+
+    let (actual, _) = run(&format!("exec 6<>{path}; echo -n ab >&6; cat {path}"));
+
+    assert_eq!(actual, expected);
+}
+
+/// `<>` creates a missing file, same as `>`.
+#[test]
+fn read_write_redirect_creates_a_missing_file() {
+    let expected = "made\n";
+    let path = "/tmp/walker-readwrite-new";
+    let _ = std::fs::remove_file(path);
+
+    let (actual, _) = run(&format!("exec 7<>{path}; echo made >&7; cat {path}"));
+
+    assert_eq!(actual, expected);
+}
+
+/// `{v}>file` opens on a descriptor the shell picks and stores the number in
+/// the named variable. bash hands out 10 first, then 11.
+#[test]
+fn a_descriptor_variable_redirect_reports_the_fd_the_shell_chose() {
+    let expected = "10 11\nbody\n";
+
+    let (actual, _) = run(
+        "exec {a}>/tmp/walker-fdvar-a; exec {b}>/tmp/walker-fdvar-b; echo $a $b; \
+         echo body >&$a; cat /tmp/walker-fdvar-a",
+    );
+
+    assert_eq!(actual, expected);
+}
+
+/// The number outlives the redirect even on an ordinary command, and
+/// overwrites whatever the variable held.
+#[test]
+fn a_descriptor_variable_keeps_its_number_after_the_command() {
+    let expected = "x\nq=10\n";
+
+    let (actual, _) = run("v=9; echo x {q}>/tmp/walker-fdvar-c; echo q=$q");
+
+    assert_eq!(actual, expected);
+}
+
+/// Only `{identifier}` hard against the operator is a descriptor variable.
+/// `{a} >f` is an argument then a redirect, and `{a,b}>f` is brace expansion.
+#[test]
+fn a_braced_word_that_is_not_a_descriptor_variable_stays_an_argument() {
+    let expected = "a=[]\nhi {a}\n";
+
+    let (actual, _) =
+        run("echo hi {a} >/tmp/walker-fdvar-d; echo \"a=[$a]\"; cat /tmp/walker-fdvar-d");
+
+    assert_eq!(actual, expected);
+}
+
 #[test]
 fn a_backtick_substitution_is_opaque_to_brace_expansion() {
     let expected = "foo 1 2 bar\n";

@@ -87,6 +87,18 @@ impl<'a> Parser<'a> {
     /// `simple_list simple_list_terminator | ...`, parse.y:433 onward,
     /// scoped to this grammar).
     pub fn parse_program(&mut self) -> Result<Command, ParseError> {
+        // A script of nothing but blank lines and comments is a valid bash
+        // program that runs nothing. An empty *compound_list* is not, so the
+        // emptiness is allowed here and never in `parse_command_list`.
+        self.skip_newlines()?;
+        if matches!(self.peek()?, Token::Eof) {
+            return Ok(Command::Simple(SimpleCommand {
+                assignments: Vec::new(),
+                program: None,
+                args: Vec::new(),
+                redirects: Vec::new(),
+            }));
+        }
         self.parse_command_list(|t| matches!(t, Token::Eof))
     }
 
@@ -173,25 +185,59 @@ impl<'a> Parser<'a> {
         match self.peek()? {
             Token::Word(w, _) if w == "!" => {
                 self.advance()?;
-                return Ok(Command::Invert(Box::new(self.parse_pipeline()?)));
+                let inner = self.parse_pipeline_or_nothing()?;
+                return Ok(Command::Invert(Box::new(inner)));
             }
             Token::Word(w, _) if w == "time" => {
                 self.advance()?;
                 if matches!(self.peek()?, Token::Word(f, _) if f == "-p") {
                     self.advance()?; // POSIX-format flag; not represented in the AST
                 }
-                return Ok(Command::Time(Box::new(self.parse_pipeline()?)));
+                if matches!(self.peek()?, Token::Word(f, _) if f == "--") {
+                    self.advance()?;
+                }
+                let inner = self.parse_pipeline_or_nothing()?;
+                return Ok(Command::Time(Box::new(inner)));
             }
             _ => {}
         }
         let mut left = self.parse_command()?;
-        while matches!(self.peek()?, Token::Pipe) {
+        while matches!(self.peek()?, Token::Pipe | Token::PipeAmp) {
+            if matches!(self.peek()?, Token::PipeAmp) {
+                left = merge_stderr_into_stdout(left);
+            }
             self.advance()?;
             self.skip_newlines()?;
             let right = self.parse_command()?;
             left = Command::Connection(Connection { left: Box::new(left), right: Box::new(right), connector: Connector::Pipe });
         }
         Ok(left)
+    }
+
+    /// `!` and `time` both take an optionally EMPTY pipeline: bash runs `!`
+    /// on its own (status 1), `! !` (status 0) and a bare `time` (which
+    /// times nothing and prints the format).
+    fn parse_pipeline_or_nothing(&mut self) -> Result<Command, ParseError> {
+        if self.at_command_end()? {
+            return Ok(Command::Simple(SimpleCommand {
+                assignments: Vec::new(),
+                program: None,
+                args: Vec::new(),
+                redirects: Vec::new(),
+            }));
+        }
+        self.parse_pipeline()
+    }
+
+    fn at_command_end(&mut self) -> Result<bool, ParseError> {
+        Ok(match self.peek()? {
+            Token::Semi | Token::Newline | Token::Eof | Token::Amp | Token::RParen
+            | Token::DSemi | Token::SemiAmp | Token::DSemiAmp | Token::And | Token::Or => true,
+            Token::Word(w, _) => {
+                matches!(w.as_str(), "}" | "fi" | "done" | "esac" | "then" | "else" | "elif")
+            }
+            _ => false,
+        })
     }
 
     fn parse_command(&mut self) -> Result<Command, ParseError> {
@@ -254,13 +300,20 @@ impl<'a> Parser<'a> {
         let mut redirects = Vec::new();
         loop {
             match self.peek()? {
-                Token::Great | Token::DGreat | Token::Less | Token::DLess | Token::DLessDash
-                | Token::DLessLess | Token::GreatAmp | Token::LessAmp | Token::AmpGreat
-                | Token::AmpDGreat => redirects.push(self.parse_redirect(None)?),
+                Token::Great | Token::DGreat | Token::Less | Token::LessGreat | Token::DLess
+                | Token::DLessDash | Token::DLessLess | Token::GreatAmp | Token::GreatPipe
+                | Token::LessAmp | Token::AmpGreat | Token::AmpDGreat => {
+                    redirects.push(self.parse_redirect(None, None)?)
+                }
                 Token::Fd(n) => {
                     let n = *n;
                     self.advance()?;
-                    redirects.push(self.parse_redirect(Some(n))?);
+                    redirects.push(self.parse_redirect(Some(n), None)?);
+                }
+                Token::FdVar(name) => {
+                    let name = name.clone();
+                    self.advance()?;
+                    redirects.push(self.parse_redirect(None, Some(name))?);
                 }
                 _ => break,
             }
@@ -297,7 +350,19 @@ impl<'a> Parser<'a> {
         if matches!(self.peek()?, Token::Arith(_)) {
             let Token::Arith(expr) = self.advance()? else { unreachable!() };
             self.consume_list_separators()?;
-            let body = self.parse_do_done()?;
+            // `for ((...)) { list; }` is a body form bash accepts only here:
+            // `for x in a b { ...; }` and `while c { ...; }` are both syntax
+            // errors. bash prints it back as the ordinary do/done loop.
+            let body = if matches!(self.peek()?, Token::Word(w, _) if w == "{") {
+                self.advance()?;
+                let inner =
+                    self.parse_command_list(|t| matches!(t, Token::Word(w, _) if w == "}"))?;
+                self.skip_newlines()?;
+                self.expect_word("}")?;
+                Box::new(inner)
+            } else {
+                self.parse_do_done()?
+            };
             return Ok(Command::ArithFor { expr, body });
         }
         let var = match self.advance()? {
@@ -460,9 +525,13 @@ impl<'a> Parser<'a> {
                         // Only checkable after the name is consumed (single-
                         // token lookahead), which is why this lives here and
                         // not in parse_command.
+                        // The name is any word bash did not already lex as an
+                        // assignment: `foo-a`, `foo.bar`, `1foo` and `a/b` are
+                        // all legal function names, so no identifier rule
+                        // applies here (only `a=b() { :; }` is a syntax error,
+                        // and the assignment branch above has taken that).
                         if assignments.is_empty()
                             && redirects.is_empty()
-                            && is_name(&w)
                             && matches!(self.peek()?, Token::LParen)
                         {
                             self.advance()?;
@@ -476,15 +545,20 @@ impl<'a> Parser<'a> {
                         args.push(Word { text: w, quoted });
                     }
                 }
-                Token::Great | Token::DGreat | Token::Less | Token::DLess | Token::DLessDash
-                | Token::DLessLess | Token::GreatAmp | Token::LessAmp | Token::AmpGreat
-                | Token::AmpDGreat => {
-                    redirects.push(self.parse_redirect(None)?);
+                Token::Great | Token::DGreat | Token::Less | Token::LessGreat | Token::DLess
+                | Token::DLessDash | Token::DLessLess | Token::GreatAmp | Token::GreatPipe
+                | Token::LessAmp | Token::AmpGreat | Token::AmpDGreat => {
+                    redirects.push(self.parse_redirect(None, None)?);
                 }
                 Token::Fd(n) => {
                     let n = *n;
                     self.advance()?;
-                    redirects.push(self.parse_redirect(Some(n))?);
+                    redirects.push(self.parse_redirect(Some(n), None)?);
+                }
+                Token::FdVar(name) => {
+                    let name = name.clone();
+                    self.advance()?;
+                    redirects.push(self.parse_redirect(None, Some(name))?);
                 }
                 _ => break,
             }
@@ -496,11 +570,20 @@ impl<'a> Parser<'a> {
         Ok(Command::Simple(SimpleCommand { assignments, program, args, redirects }))
     }
 
-    fn parse_redirect(&mut self, fd: Option<u32>) -> Result<Redirect, ParseError> {
+    fn parse_redirect(
+        &mut self,
+        fd: Option<u32>,
+        fd_var: Option<String>,
+    ) -> Result<Redirect, ParseError> {
         let op = match self.advance()? {
             Token::Great => RedirectOp::Out,
+            // `>|` is `>` with noclobber overridden, and the two differ only
+            // when noclobber is on. `set -C`/`set -o noclobber` is refused
+            // outright, so no script this executes can tell them apart.
+            Token::GreatPipe => RedirectOp::Out,
             Token::DGreat => RedirectOp::Append,
             Token::Less => RedirectOp::In,
+            Token::LessGreat => RedirectOp::ReadWrite,
             Token::DLess => RedirectOp::Heredoc,
             Token::DLessDash => RedirectOp::HeredocStrip,
             Token::DLessLess => RedirectOp::HereString,
@@ -510,7 +593,7 @@ impl<'a> Parser<'a> {
             Token::AmpDGreat => RedirectOp::AppendOutErr,
             t => return Err(ParseError::Unexpected(format!("{t:?}"))),
         };
-        let target = match self.advance()? {
+        let mut target = match self.advance()? {
             Token::Word(w, quoted) => Word { text: w, quoted },
             t => return Err(ParseError::Unexpected(format!("expected redirect target, got {t:?}"))),
         };
@@ -525,14 +608,40 @@ impl<'a> Parser<'a> {
         // failing test: `'EOF'` never matched a body line reading `EOF`).
         match op {
             RedirectOp::Heredoc | RedirectOp::HeredocStrip => {
-                let bare_delim: String =
-                    target.text.chars().filter(|c| *c != '\'' && *c != '"').collect();
-                self.lexer.register_heredoc(bare_delim, matches!(op, RedirectOp::HeredocStrip));
+                let bare = heredoc_delimiter(&target.text);
+                // Any quoting at all in the delimiter suppresses expansion in
+                // the body, and a backslash counts: `<<\eof` behaves exactly
+                // like `<<'eof'`.
+                target.quoted |= bare != target.text;
+                self.lexer.register_heredoc(bare, matches!(op, RedirectOp::HeredocStrip));
             }
             _ => {}
         }
-        Ok(Redirect { op, fd, target, heredoc_body: None })
+        Ok(Redirect { op, fd, fd_var, target, heredoc_body: None })
     }
+}
+
+/// A heredoc's terminator is the delimiter word after quote removal, so
+/// `<<'eof'`, `<<"eof"` and `<<\eof` all end at a line reading `eof`, and
+/// `<<\)` ends at a line reading `)`.
+fn heredoc_delimiter(word: &str) -> String {
+    let mut out = String::new();
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            '\'' => out.extend(chars.by_ref().take_while(|c| *c != '\'')),
+            '"' => loop {
+                match chars.next() {
+                    None | Some('"') => break,
+                    Some('\\') => out.extend(chars.next()),
+                    Some(c) => out.push(c),
+                }
+            },
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// `NAME=value` at the *start* of a word only — bash's `token_is_assignment`
@@ -551,6 +660,30 @@ fn split_assignment(w: &str) -> Option<(String, String, bool)> {
         return None;
     }
     Some((name.to_string(), rest[1..].to_string(), append))
+}
+
+/// `|&`'s desugaring: `2>&1` appended to the LEFT stage's own redirects,
+/// after whatever it already carries. bash prints `echo a 2>/dev/null |& cat`
+/// back as `echo a 2> /dev/null 2>&1 | cat`, so the order is not free.
+fn merge_stderr_into_stdout(cmd: Command) -> Command {
+    let merge = Redirect {
+        op: RedirectOp::DupOut,
+        fd: Some(2),
+        fd_var: None,
+        target: Word { text: "1".to_string(), quoted: false },
+        heredoc_body: None,
+    };
+    match cmd {
+        Command::Simple(mut s) => {
+            s.redirects.push(merge);
+            Command::Simple(s)
+        }
+        Command::Redirected { command, mut redirects } => {
+            redirects.push(merge);
+            Command::Redirected { command, redirects }
+        }
+        other => Command::Redirected { command: Box::new(other), redirects: vec![merge] },
+    }
 }
 
 fn is_name(s: &str) -> bool {
@@ -667,6 +800,25 @@ fn parse_cond_chunks(chunks: &[String]) -> Result<CondExpr, ParseError> {
     Ok(expr)
 }
 
+/// Parse `src` as the interior of a `$(...)`/`<(...)`/`>(...)` and return the
+/// byte offset of the `)` that ended it. Bash finds that paren by parsing
+/// rather than by counting brackets, so a `)` closing a case pattern, or one
+/// sitting in a comment or a heredoc body, is passed over the way bash passes
+/// over it.
+pub(crate) fn scan_until_unmatched_rparen(src: &str) -> Result<usize, ParseError> {
+    let mut p = Parser::new(src);
+    p.lexer.set_in_command_substitution();
+    p.skip_newlines()?;
+    // `$()` and `$( # comment\n)` are both empty and both legal.
+    if !matches!(p.peek()?, Token::RParen) {
+        p.parse_command_list(|t| matches!(t, Token::RParen))?;
+    }
+    match p.peek()? {
+        Token::RParen => Ok(p.lexer.token_start()),
+        t => Err(ParseError::Unexpected(format!("{t:?}"))),
+    }
+}
+
 pub fn parse(src: &str) -> Result<Command, ParseError> {
     let mut parser = Parser::new(src);
     let mut cmd = parser.parse_program()?;
@@ -742,6 +894,246 @@ mod tests {
         match cmd {
             Command::Simple(s) => s,
             other => panic!("expected Simple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_program_parses_as_a_command_that_does_nothing() {
+        // bash -n accepts "", "# c" and a run of blank lines.
+        for src in ["", "\n\n", "# comment\n", "\n# comment\n\n"] {
+            let cmd = parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            let s = simple(&cmd);
+            assert!(s.program.is_none());
+            assert!(s.assignments.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_empty_compound_list_is_still_an_error() {
+        // bash -n rejects `( )` and `{ }`.
+        assert!(parse("( )").is_err());
+        assert!(parse("{ }").is_err());
+    }
+
+    #[test]
+    fn pipe_ampersand_sends_stderr_down_the_pipe_after_the_stages_own_redirects() {
+        // bash prints `echo a 2>/dev/null |& cat` back as
+        // `echo a 2> /dev/null 2>&1 | cat`, so the merge lands last.
+        let cmd = parse("echo a 2>/dev/null |& cat").unwrap();
+        let Command::Connection(c) = &cmd else { panic!("expected a pipeline, got {cmd:?}") };
+        assert_eq!(c.connector, Connector::Pipe);
+        let left = simple(&c.left);
+        let ops: Vec<_> = left.redirects.iter().map(|r| (r.op, r.fd, r.target.text.as_str())).collect();
+        assert_eq!(ops, vec![(RedirectOp::Out, Some(2), "/dev/null"), (RedirectOp::DupOut, Some(2), "1")]);
+    }
+
+    #[test]
+    fn bang_and_time_each_take_an_empty_pipeline() {
+        // bash runs all three: `!` exits 1, `! !` exits 0, `time` times
+        // nothing and still prints its format.
+        for src in ["!", "! !", "time", "time -p", "time --", "{ time; echo after; }"] {
+            parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+        }
+        let Command::Invert(inner) = parse("!").unwrap() else { panic!("expected invert") };
+        assert!(simple(&inner).program.is_none());
+    }
+
+    #[test]
+    fn arith_for_accepts_a_brace_body() {
+        // Only the `for ((...))` form takes it: `for x in a b { ...; }` and
+        // `while c { ...; }` are syntax errors in bash.
+        let cmd = parse("for ((i=0; i<2; i++)) { echo $i; }").unwrap();
+        let Command::ArithFor { expr, body } = &cmd else { panic!("expected arith-for, got {cmd:?}") };
+        assert_eq!(expr, "((i=0; i<2; i++))");
+        assert_eq!(simple(body).program.as_ref().unwrap().text, "echo");
+        assert!(parse("for x in a b { echo $x; }").is_err());
+        assert!(parse("while true { echo x; }").is_err());
+    }
+
+    #[test]
+    fn parens_inside_a_cond_need_no_surrounding_spaces() {
+        // bash prints `[[ (-n a) ]]` back as `[[ ( -n a ) ]]`.
+        let cmd = parse("[[ (-n a) ]]").unwrap();
+        let Command::Cond(CondExpr::Group(inner)) = &cmd else { panic!("expected a group, got {cmd:?}") };
+        assert!(matches!(&**inner, CondExpr::Unary { op, operand } if op == "-n" && operand.text == "a"));
+        parse("[[ ( $t -gt 0 && $r = t) || ($t -eq 0 && $r = f) ]]").unwrap();
+    }
+
+    #[test]
+    fn a_cond_paren_that_belongs_to_a_pattern_is_not_a_group() {
+        // An extglob head keeps its parens (`[[ ]]` reads extglob whatever
+        // shopt says), and so does the operand after `=~`.
+        let cmd = parse("[[ ab == @(a)b ]]").unwrap();
+        let Command::Cond(CondExpr::Binary { right, .. }) = &cmd else { panic!("got {cmd:?}") };
+        assert_eq!(right.text, "@(a)b");
+        let cmd = parse("[[ abc =~ ^(a|b) ]]").unwrap();
+        let Command::Cond(CondExpr::Binary { right, .. }) = &cmd else { panic!("got {cmd:?}") };
+        assert_eq!(right.text, "^(a|b)");
+    }
+
+    #[test]
+    fn a_function_name_is_any_word_that_is_not_an_assignment() {
+        // bash defines all of these; only `a=b() { :; }` is a syntax error,
+        // because `a=b` lexes as an assignment before the `(` is reached.
+        for name in ["foo-a", "foo.bar", "1foo", "a/b", "a%b"] {
+            let src = format!("{name}() {{ echo x; }}");
+            let cmd = parse(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            let Command::FunctionDef { name: got, .. } = &cmd else { panic!("got {cmd:?}") };
+            assert_eq!(got, name);
+        }
+    }
+
+    #[test]
+    fn clobbering_redirect_is_an_ordinary_output_redirect() {
+        // `>|` only differs from `>` under noclobber, which the walker
+        // refuses outright.
+        let cmd = parse("echo b >| /tmp/x").unwrap();
+        let s = simple(&cmd);
+        assert_eq!(s.redirects[0].op, RedirectOp::Out);
+        assert_eq!(s.redirects[0].target.text, "/tmp/x");
+    }
+
+    #[test]
+    fn a_command_substitution_closes_where_the_parse_ends_not_where_brackets_balance() {
+        // Each `)` here belongs to something inside: a case pattern, a
+        // comment, a heredoc body. Counting brackets ends the span early.
+        for (src, expected) in [
+            ("echo $(case a in a) echo z;; esac)", "$(case a in a) echo z;; esac)"),
+            ("echo $(echo one # comment with )\n)", "$(echo one # comment with )\n)"),
+            ("echo $(cat <<eof\nbody )\neof\n)", "$(cat <<eof\nbody )\neof\n)"),
+            ("echo $()", "$()"),
+        ] {
+            let cmd = parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            assert_eq!(simple(&cmd).args[0].text, expected, "for {src:?}");
+        }
+    }
+
+    #[test]
+    fn arithmetic_still_wins_over_command_substitution_where_bash_gives_it_priority() {
+        // `$((` is arithmetic when the span really is `((expr))`, and a
+        // substitution otherwise. The tie-break has to look past a nested
+        // `$(...)`, whose parens are not this span's.
+        let cmd = parse("echo $((1+2)) $((echo a); echo b) $(( $(case x in x) esac) ))").unwrap();
+        let args: Vec<_> = simple(&cmd).args.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(
+            args,
+            vec!["$((1+2))", "$((echo a); echo b)", "$(( $(case x in x) esac) ))"]
+        );
+    }
+
+    #[test]
+    fn a_parameter_expansion_ends_at_the_first_unescaped_brace() {
+        // A bare `{` inside `${...}` does not nest: bash reads `${IFS+d{}}`
+        // as the word `${IFS+d{}` plus a literal `}`, and prints `d{}`.
+        // Nested `${`, `$(` and backticks are recursed into, so they stay
+        // whole.
+        for (src, expected) in [
+            ("echo ${IFS+d{}}", "${IFS+d{}}"),
+            ("echo ${IFS+a$u{{{\\}b}", "${IFS+a$u{{{\\}b}"),
+            ("echo ${x:-$(echo })}", "${x:-$(echo })}"),
+            ("echo ${x:-`echo }`}", "${x:-`echo }`}"),
+            ("echo ${x-'}'}", "${x-'}'}"),
+            ("echo ${x:-${y}}", "${x:-${y}}"),
+        ] {
+            let cmd = parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            assert_eq!(simple(&cmd).args[0].text, expected, "for {src:?}");
+        }
+    }
+
+    #[test]
+    fn a_backtick_span_ends_at_the_first_unescaped_backtick() {
+        // bash tracks no quote state inside backticks, so a quoted backtick
+        // still closes the span and `\\` is just an escaped backslash.
+        let cmd = parse(r#"recho `echo "(\\")"`"#).unwrap();
+        assert_eq!(simple(&cmd).args[0].text, r#"`echo "(\\")"`"#);
+        assert!(parse(r#"echo `echo "a`b"`"#).is_err());
+    }
+
+    #[test]
+    fn a_heredoc_delimiter_is_taken_after_quote_removal() {
+        // `<<\eof`, `<<'eof'` and `<<"eof"` all end at a line reading `eof`,
+        // and all three suppress expansion in the body.
+        for src in [
+            "cat <<\\eof\n$x\neof\n",
+            "cat <<'eof'\n$x\neof\n",
+            "cat <<\"eof\"\n$x\neof\n",
+        ] {
+            let cmd = parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            let r = &simple(&cmd).redirects[0];
+            assert_eq!(r.heredoc_body.as_deref(), Some("$x\n"), "for {src:?}");
+            assert!(r.target.quoted, "for {src:?}");
+        }
+        let cmd = parse("cat <<eof\n$x\neof\n").unwrap();
+        assert!(!simple(&cmd).redirects[0].target.quoted);
+    }
+
+    #[test]
+    fn a_heredoc_inside_a_command_substitution_ends_where_its_delimiter_begins_a_line() {
+        // bash warns and ends the body at `EOF)`, then parses the rest of
+        // that line — which is what closes the substitution. Outside one,
+        // the delimiter still has to be the whole line.
+        let cmd = parse("x=$(cat <<EOF\nhi\nEOF)\n").unwrap();
+        assert_eq!(simple(&cmd).assignments[0].value.text, "$(cat <<EOF\nhi\nEOF)");
+        let cmd = parse("cat <<EOF\nhi\nEOFX\nEOF\n").unwrap();
+        assert_eq!(simple(&cmd).redirects[0].heredoc_body.as_deref(), Some("hi\nEOFX\n"));
+    }
+
+    #[test]
+    fn a_line_continuation_leaves_nothing_behind() {
+        // bash removes backslash-newline before tokenizing, in double quotes
+        // as well as out of them, but never inside single quotes.
+        assert_eq!(simple(&parse("echo a\\\nb").unwrap()).args[0].text, "ab");
+        assert_eq!(simple(&parse("echo \"a\\\nb\"").unwrap()).args[0].text, "\"ab\"");
+        assert_eq!(simple(&parse("echo 'a\\\nb'").unwrap()).args[0].text, "'a\\\nb'");
+        let cmd = parse("cat <<\\EOT\\\n4\nbody\nEOT4\n").unwrap();
+        assert_eq!(simple(&cmd).redirects[0].heredoc_body.as_deref(), Some("body\n"));
+    }
+
+    #[test]
+    fn a_cond_subscript_stays_one_chunk() {
+        // `index[7<(4+2)]` is one word in bash, parens and quoted brackets
+        // included, and an unmatched `[` is ordinary text.
+        for src in [
+            "[[ index[7<(4+2)] -le assoc[0] ]]",
+            "[[ ']' =~ [']'] ]]",
+            "[[ a[ == b ]]",
+            "[[ ${v} =~ (one two) ]]",
+        ] {
+            parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn read_write_redirect_is_its_own_operator() {
+        let cmd = parse("exec 6<>/tmp/f").unwrap();
+        let r = &simple(&cmd).redirects[0];
+        assert_eq!((r.op, r.fd, r.target.text.as_str()), (RedirectOp::ReadWrite, Some(6), "/tmp/f"));
+        let cmd = parse("cat <>/tmp/f").unwrap();
+        assert_eq!(simple(&cmd).redirects[0].fd, None);
+    }
+
+    #[test]
+    fn a_braced_name_against_a_redirect_operator_names_a_variable_not_a_word() {
+        let cmd = parse("echo hi {v}>>/tmp/f").unwrap();
+        let s = simple(&cmd);
+        assert_eq!(s.args.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(), vec!["hi"]);
+        assert_eq!(s.redirects[0].fd_var.as_deref(), Some("v"));
+        assert_eq!(s.redirects[0].op, RedirectOp::Append);
+        for src in ["exec {v}</tmp/f", "exec {v}<>/tmp/f", "exec {_x9}>/tmp/f"] {
+            let cmd = parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            assert!(simple(&cmd).redirects[0].fd_var.is_some(), "for {src:?}");
+        }
+    }
+
+    #[test]
+    fn a_braced_word_that_is_not_a_descriptor_variable_stays_an_argument() {
+        // bash needs an identifier in the braces AND the operator hard
+        // against them. Each of these is an ordinary word plus a redirect.
+        for src in ["echo {a} >/tmp/f", "echo {a,b}>/tmp/f", "echo {1..2}>/tmp/f", "echo {}>/tmp/f"] {
+            let cmd = parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            let s = simple(&cmd);
+            assert!(s.redirects[0].fd_var.is_none(), "for {src:?}");
+            assert_eq!(s.args.len(), 1, "for {src:?}");
         }
     }
 

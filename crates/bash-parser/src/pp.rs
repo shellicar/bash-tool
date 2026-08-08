@@ -34,12 +34,16 @@ fn write_redirect(out: &mut String, r: &Redirect, depth: usize) {
         RedirectOp::Heredoc => "<<",
         RedirectOp::HeredocStrip => "<<-",
         RedirectOp::HereString => "<<<",
+        RedirectOp::ReadWrite => "<>",
     };
-    match r.fd {
-        Some(fd) => {
+    match (&r.fd_var, r.fd) {
+        (Some(name), _) => {
+            let _ = write!(out, "redirect {{{name}}}{sym} ");
+        }
+        (None, Some(fd)) => {
             let _ = write!(out, "redirect {fd}{sym} ");
         }
-        None => {
+        (None, None) => {
             let _ = write!(out, "redirect {sym} ");
         }
     }
