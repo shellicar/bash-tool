@@ -42,6 +42,45 @@ pub fn run_with(
     clk: Arc<dyn clock::Clock + Send + Sync>,
     entropy: Arc<dyn clock::Entropy + Send + Sync>,
 ) -> (String, i32) {
+    match parse_top(src) {
+        Ok(None) => (String::new(), 0),
+        Ok(Some(cmd)) => run_tree_with(&cmd, state, clk, entropy),
+        Err(msg) => (msg, 2),
+    }
+}
+
+/// Empty input is a valid empty program — `bash -c ''` succeeds doing
+/// nothing — so `None` is a program, not a failure. The error string is the
+/// exact text the walker printed when it parsed inside itself, because that
+/// is what the conformance gate compares.
+fn parse_top(src: &str) -> Result<Option<bash_parser::Command>, String> {
+    if src.trim().is_empty() {
+        return Ok(None);
+    }
+    match bash_parser::parse(src) {
+        Ok(cmd) => Ok(Some(cmd)),
+        Err(e) => Err(format!("bash-walker: syntax error: {e}\n")),
+    }
+}
+
+/// The same run, given the tree instead of the text. This is the seam the
+/// binary composes on: it parses, inspects, and only then hands the tree over,
+/// so what was approved and what runs are the same object.
+pub fn run_tree(cmd: &bash_parser::Command, state: &mut ShellState) -> (String, i32) {
+    run_tree_with(
+        cmd,
+        state,
+        Arc::new(clock::RealClock::default()),
+        Arc::new(clock::RealEntropy),
+    )
+}
+
+pub fn run_tree_with(
+    cmd: &bash_parser::Command,
+    state: &mut ShellState,
+    clk: Arc<dyn clock::Clock + Send + Sync>,
+    entropy: Arc<dyn clock::Entropy + Send + Sync>,
+) -> (String, i32) {
     let mut shared = Shared { clock: clk, entropy, ..Shared::default() };
     let mut ex = Exec { state, shared: &mut shared };
     let capture = match ex.anon_temp() {
@@ -61,7 +100,9 @@ pub fn run_with(
         derived: false,
     };
 
-    let status = match walk::run_source(&mut ex, &ctx, src, false) {
+    // A syntax error can still arrive from here: `eval`, `source` and a
+    // substitution interior are all text this tree only holds opaquely.
+    let status = match ex.exec(cmd, &ctx, false) {
         Ok(st) => st,
         Err(Flow::Exit(st)) => st,
         Err(Flow::Return(st)) => st,
@@ -156,6 +197,23 @@ pub fn run_streaming(
     stdout: std::fs::File,
     stderr: std::fs::File,
 ) -> i32 {
+    match parse_top(src) {
+        Ok(None) => 0,
+        Ok(Some(cmd)) => run_tree_streaming(&cmd, state, stdout, stderr),
+        Err(msg) => {
+            use std::io::Write;
+            let _ = (&stderr).write_all(msg.as_bytes());
+            2
+        }
+    }
+}
+
+pub fn run_tree_streaming(
+    cmd: &bash_parser::Command,
+    state: &mut ShellState,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+) -> i32 {
     let mut shared = Shared::default();
     let mut ex = Exec { state, shared: &mut shared };
     let ctx = Ctx {
@@ -165,7 +223,7 @@ pub fn run_streaming(
         fds: std::collections::HashMap::new(),
         derived: false,
     };
-    let status = match walk::run_source(&mut ex, &ctx, src, false) {
+    let status = match ex.exec(cmd, &ctx, false) {
         Ok(st) => st,
         Err(Flow::Exit(st)) => st,
         Err(Flow::Return(st)) => st,

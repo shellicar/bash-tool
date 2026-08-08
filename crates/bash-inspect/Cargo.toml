@@ -6,11 +6,13 @@ edition.workspace = true
 [lints]
 workspace = true
 
-# The stage between parsing and execution. bash-parser answers whether text is
-# bash syntax; this answers whether the walker can execute the result, and it
-# answers before any of it runs. A construct refused mid-walk has already let
-# everything above it take effect, so the caller approved one script and got
-# part of one — refusing up front leaves no partial state to reason about
+# The middle of three phases: parse, inspect, walk. Takes the tree bash-parser
+# produced and reports which constructs the walker cannot execute. It only
+# reports — the binary composes the phases and decides. Whether execution goes
+# ahead is the caller's, and it asks before any of the script runs, because a
+# construct refused mid-walk has already let everything above it take effect
 # (CLAUDE.md, "Unsupported constructs are refused by static inspection").
+#
+# It depends on bash-parser for the AST alone, and never calls parse().
 [dependencies]
 bash-parser = { path = "../bash-parser" }

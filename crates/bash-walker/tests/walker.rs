@@ -1385,39 +1385,59 @@ fn ansi_c_quoting_survives_inside_a_command_substitution() {
     assert_eq!(actual, expected);
 }
 
-/// `--inspect` answers whether a script can run and runs none of it. The
-/// script here would print "start" before reaching its first refused
-/// construct, so seeing no output at all is the evidence that inspection
-/// finishes before execution begins.
+/// Inspection is not opt-in: an ordinary invocation parses, inspects, and only
+/// then walks. This script would print "start" before reaching the construct
+/// that gets refused, so seeing no "start" anywhere is the evidence that
+/// nothing ran.
 #[test]
-fn inspect_reports_every_refused_construct_and_executes_nothing() {
+fn a_refused_construct_stops_the_whole_script_from_running() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_bash-walker"))
-        .args([
-            "--inspect",
-            "-c",
-            "echo start\nset -o posix\nselect x in a b; do echo $x; done\ncoproc cat\n",
-        ])
+        .args(["-c", "echo RAN_BEFORE\nset -o posix\necho RAN_AFTER\n"])
+        .output()
+        .expect("binary should run");
+    // `-c` keeps the combined-on-stdout contract the replay harness reads.
+    let combined = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!combined.contains("RAN_BEFORE"), "nothing should have run: {combined}");
+    assert!(!combined.contains("RAN_AFTER"), "nothing should have run: {combined}");
+    assert!(combined.contains("-c: error: set -o posix:"), "{combined}");
+    assert!(combined.contains("-c: note: no equivalent:"), "{combined}");
+    assert!(combined.contains("1 construct cannot be executed"), "{combined}");
+    assert!(combined.contains("Nothing ran"), "{combined}");
+}
+
+/// A script run by path is a shell, so its diagnostics go to stderr and its
+/// stdout stays clean.
+#[test]
+fn a_refused_script_by_path_reports_on_stderr_and_runs_nothing() {
+    let dir = temp_dir("inspect-path");
+    let script = dir.join("refused.sh");
+    std::fs::write(&script, "echo RAN_BEFORE\nset -o posix\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bash-walker"))
+        .arg(&script)
         .output()
         .expect("binary should run");
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty(), "nothing should have run, got {:?}", out.stdout);
-    assert!(stderr.contains("-c: error: set -o posix:"), "{stderr}");
-    assert!(stderr.contains("-c: error: select:"), "{stderr}");
-    assert!(stderr.contains("-c: error: coproc:"), "{stderr}");
-    assert!(stderr.contains("3 constructs cannot be executed"), "{stderr}");
+    assert!(stderr.contains("error: set -o posix:"), "{stderr}");
     assert!(stderr.contains("Nothing ran"), "{stderr}");
 }
 
+/// The other half of the same claim: inspection passing is silent, and the
+/// script runs exactly as before.
 #[test]
-fn inspect_approves_a_script_the_walker_can_run() {
+fn a_script_with_nothing_to_refuse_runs_untouched() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_bash-walker"))
-        .args(["--inspect", "-c", "cd /tmp && ls | wc -l"])
+        .args(["-c", "echo start; echo end"])
         .output()
         .expect("binary should run");
+
     assert_eq!(out.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("no findings"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "start\nend\n");
 }
 
 #[test]

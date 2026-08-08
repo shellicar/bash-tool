@@ -2,19 +2,26 @@
 
 A bash implementation in Rust, built so that a command can be inspected and
 approved before it runs, and so that the thing approved is the thing that runs.
-Three crates, three questions:
+Three crates, three questions, composed by the binary as parse, inspect, walk:
 
 - `bash-parser` — text in, tree out. It answers one question: is this bash
-  syntax. It has no opinion about what can be executed.
-- `bash-inspect` — reads the source and its tree, and answers whether the
-  walker can execute it, before any of it runs. Pass, or every construct it
-  refuses with a suggestion for each. Findings carry no line and column yet:
-  positions belong on the AST, which is the parser's own work. It currently
-  owns `set -o posix`, `select` and `coproc`; the rest of the unsupported list
-  is still inline in the walker as runtime refusals. Reachable as `bash-walker
-  --inspect <path|-c script>`, not yet on the default execution path.
+  syntax. It has no opinion about what can be executed. Parsing is
+  representation: anything with a grammar gets a node, however awkward it is to
+  parse, because the node is what lets a later stage name the construct and say
+  why it will not run.
+- `bash-inspect` — tree in, findings out. It reports which constructs the
+  walker cannot execute and what to do instead. It only reports: it does not
+  parse, does not execute, and does not decide. Findings carry no line and
+  column, because positions belong on the AST and that is the parser's work.
+  Today it reports `set -o posix`; `select` and `coproc` have entries waiting
+  for their nodes, and the rest of the unsupported list is still inline in the
+  walker as runtime refusals.
 - `bash-walker` — executes that tree. Expansion, redirection, pipelines on real
   OS pipes, job control, builtins, arithmetic, `set -x`, and shell state.
+
+Inspection is not opt-in. Every invocation parses, inspects, and walks only
+what came back with no findings, so a refused construct anywhere in a script
+means no part of that script runs.
 
 It exists to replace unconstrained `bash -c` as the tool a fleet Claude runs
 commands through. A raw string can only be guessed at before it executes; a

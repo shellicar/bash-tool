@@ -1,66 +1,41 @@
 //! Every expectation here was first put to bash 5.3 at ~/repos/gnu/bash/bash,
 //! which decides what a construct is; the tests record its answers.
 
-use bash_inspect::{inspect, Construct, Refusal};
+use bash_inspect::{inspect, render, Construct};
 
-fn refusal(source: &str) -> Vec<Construct> {
-    match inspect(source) {
-        Err(Refusal::Unsupported(report)) => {
-            report.findings().iter().map(|f| f.construct).collect()
-        }
-        Err(Refusal::Syntax(e)) => panic!("expected a refusal, got a syntax error: {e}"),
-        Ok(_) => Vec::new(),
-    }
+/// Inspection takes a tree, so a test states its script the way the tool does:
+/// parse first, then inspect what came back.
+fn findings(source: &str) -> Vec<Construct> {
+    let tree = bash_parser::parse(source).expect("script should parse");
+    inspect(&tree).iter().map(|f| f.construct).collect()
 }
 
 fn approved(source: &str) -> bool {
-    inspect(source).is_ok()
+    findings(source).is_empty()
 }
 
 #[test]
-fn an_ordinary_script_is_approved_and_hands_back_its_tree() {
+fn an_ordinary_script_has_nothing_to_refuse() {
     assert!(approved("cd /tmp && ls -la | grep foo > out.txt"));
 }
 
 #[test]
 fn set_o_posix_is_refused() {
-    assert_eq!(refusal("set -o posix"), [Construct::PosixMode]);
-}
-
-#[test]
-fn select_is_refused() {
-    assert_eq!(refusal("select x in a b; do echo $x; done"), [Construct::Select]);
-}
-
-#[test]
-fn coproc_is_refused() {
-    assert_eq!(refusal("coproc cat"), [Construct::Coproc]);
-}
-
-/// The reader redesigns rather than retries, so a report holding one finding
-/// out of three costs a second redesign. The parser stops at its first
-/// refusal; inspection must not.
-#[test]
-fn every_finding_is_reported_not_the_first() {
-    let script = "echo start\nset -o posix\nselect x in a; do echo $x; done\ncoproc cat\n";
-    assert_eq!(
-        refusal(script),
-        [Construct::PosixMode, Construct::Select, Construct::Coproc]
-    );
-}
-
-/// While a finding carries no location, a second occurrence of the same
-/// construct gives the reader nothing to act on that the first did not.
-#[test]
-fn a_construct_that_occurs_twice_is_reported_once() {
-    assert_eq!(refusal("set -o posix\necho hi\nset -o posix\n"), [Construct::PosixMode]);
+    assert_eq!(findings("set -o posix"), [Construct::PosixMode]);
 }
 
 /// CLAUDE.md: a construct on a branch that would not have been taken is
 /// refused too, because whether this run reaches the line is luck.
 #[test]
 fn a_construct_on_an_untaken_branch_is_still_refused() {
-    assert_eq!(refusal("if false; then set -o posix; fi"), [Construct::PosixMode]);
+    assert_eq!(findings("if false; then set -o posix; fi"), [Construct::PosixMode]);
+}
+
+/// While a finding carries no location, a second occurrence of the same
+/// construct gives the reader nothing to act on that the first did not.
+#[test]
+fn a_construct_that_occurs_twice_is_reported_once() {
+    assert_eq!(findings("set -o posix\necho hi\nset -o posix\n"), [Construct::PosixMode]);
 }
 
 #[test]
@@ -74,7 +49,7 @@ fn posix_mode_is_found_through_every_spelling_bash_accepts() {
         "set -o \"posix\"",
         "set -o po\"six\"",
     ] {
-        assert_eq!(refusal(script), [Construct::PosixMode], "script: {script:?}");
+        assert_eq!(findings(script), [Construct::PosixMode], "script: {script:?}");
     }
 }
 
@@ -99,138 +74,73 @@ fn a_computed_option_name_is_left_to_the_runtime_refusal() {
 #[test]
 fn a_word_that_merely_spells_a_construct_is_not_one() {
     assert!(approved("echo set -o posix"));
-    assert!(approved("echo select"));
-    assert!(approved("echo coproc"));
     assert!(approved("grep -r 'set -o posix' ."));
 }
 
-/// bash: `"select" x in a b; do ...` is a syntax error near `do`, and
-/// `"coproc" cat` reports "coproc: command not found" — quoting takes away
-/// reserved-word status.
-#[test]
-fn a_quoted_keyword_is_an_ordinary_command_word() {
-    assert!(approved("\"coproc\" cat"));
-}
-
-#[test]
-fn a_comment_is_not_a_command() {
-    assert!(approved("# set -o posix\necho hi"));
-}
-
-/// The scan drives the parser's lexer and registers heredoc delimiters the way
-/// the parser does. Without that the body comes back as word tokens and every
-/// line of it reads as a command.
+/// The parser captures a heredoc body verbatim and never tokenizes it, so a
+/// tree walk cannot mistake one for commands.
 #[test]
 fn a_heredoc_body_is_text_not_commands() {
-    assert!(approved("cat <<EOF\nset -o posix\nselect\ncoproc\nEOF\n"));
+    assert!(approved("cat <<EOF\nset -o posix\nEOF\n"));
     assert!(approved("cat <<-'EOF'\n\tset -o posix\n\tEOF\n"));
 }
 
 #[test]
-fn a_case_pattern_written_with_a_paren_is_not_command_position() {
-    assert!(approved("case $x in (select) echo a;; (coproc) echo b;; esac"));
-    assert!(approved("case $x in select) echo a;; esac"));
+fn a_case_pattern_is_not_a_command() {
+    assert!(approved("case $x in set) echo a;; esac"));
+    assert!(approved("case $x in (set) echo a;; esac"));
 }
 
 #[test]
 fn an_assignment_prefix_does_not_hide_the_command_word() {
-    assert_eq!(refusal("FOO=bar set -o posix"), [Construct::PosixMode]);
+    assert_eq!(findings("FOO=bar set -o posix"), [Construct::PosixMode]);
 }
 
+/// Every branch of the tree is walked, not just the top level.
 #[test]
-fn a_construct_inside_a_pipeline_or_a_subshell_is_found() {
-    assert_eq!(refusal("echo a | set -o posix"), [Construct::PosixMode]);
-    assert_eq!(refusal("(set -o posix)"), [Construct::PosixMode]);
-    assert_eq!(refusal("f() { set -o posix; }"), [Construct::PosixMode]);
-    assert_eq!(refusal("while true; do set -o posix; done"), [Construct::PosixMode]);
+fn a_construct_is_found_wherever_the_tree_holds_it() {
+    for script in [
+        "echo a | set -o posix",
+        "(set -o posix)",
+        "{ set -o posix; }",
+        "f() { set -o posix; }",
+        "while true; do set -o posix; done",
+        "until set -o posix; do :; done",
+        "for f in a b; do set -o posix; done",
+        "case $x in a) set -o posix;; esac",
+        "! set -o posix",
+        "time set -o posix",
+        "set -o posix &",
+        "{ set -o posix; } 2>/dev/null",
+        "if :; then :; else set -o posix; fi",
+    ] {
+        assert_eq!(findings(script), [Construct::PosixMode], "script: {script:?}");
+    }
 }
 
+/// CLAUDE.md: absence of output reads as success, so the rendered findings say
+/// in words that nothing ran, and name each construct and what to do instead.
 #[test]
-fn text_that_is_not_bash_syntax_stays_the_parsers_answer() {
-    assert!(matches!(inspect("echo 'unterminated"), Err(Refusal::Syntax(_))));
-}
+fn the_rendering_tells_its_reader_what_and_that_nothing_ran() {
+    let tree = bash_parser::parse("echo hi\nset -o posix\n").unwrap();
+    let text = render(&inspect(&tree), "script.sh");
 
-/// CLAUDE.md: absence of output reads as success, so the report says in words
-/// that nothing ran, and names each construct and what to do instead.
-#[test]
-fn the_report_tells_its_reader_what_and_that_nothing_ran() {
-    let Err(Refusal::Unsupported(report)) = inspect("echo hi\nselect x in a; do :; done\n") else {
-        panic!("expected a refusal");
-    };
-    let text = report.render("script.sh");
-    assert!(text.contains("script.sh: error: select:"), "{text}");
+    assert!(text.contains("script.sh: error: set -o posix:"), "{text}");
     assert!(text.contains("script.sh: note: no equivalent:"), "{text}");
     assert!(text.contains("Nothing ran"), "{text}");
     assert!(text.contains("1 construct cannot be executed"), "{text}");
 }
 
+/// A tripwire, not a wish. `select` and `coproc` have no AST node, so the
+/// parser refuses them before a tree exists and inspection never sees them.
+/// When the nodes land this test fails, which is the reminder that the
+/// construct table already holds their text and wants wiring to the new nodes.
 #[test]
-fn the_report_counts_findings_in_the_plural() {
-    let Err(Refusal::Unsupported(report)) = inspect("set -o posix\ncoproc cat\n") else {
-        panic!("expected a refusal");
-    };
-    assert!(report.render("-").contains("2 constructs cannot be executed"));
-}
-
-/// The scan works out command position from the token stream, which is a claim
-/// about grammar the parser also makes. Where a script parses, the parser's
-/// tree is the authority: walk it, look for a `set` command that asks for posix
-/// mode, and hold the scan to the same answer.
-#[test]
-fn command_position_agrees_with_the_parsers_own_tree() {
-    let scripts = [
-        "set -o posix",
-        "echo set -o posix",
-        "if false; then set -o posix; else set -o posix; fi",
-        "FOO=1 set -o posix; echo set",
-        "case $x in a) set -o posix;; b) echo set -o posix;; esac",
-        "for f in a b; do set -o posix; done",
-        "cat <<EOF\nset -o posix\nEOF",
-        "! set -o posix",
-        "time set -o posix",
-        "{ set -o posix; } 2>/dev/null",
-        "echo a > posix; set -o posix",
-        "set -o pipefail; set -o posix; set -e",
-        "echo hi",
-        "cat <<EOF\nselect\nEOF",
-    ];
-    for script in scripts {
-        let tree = bash_parser::parse(script).expect("script should parse");
-        let expected = usize::from(tree_asks_for_posix(&tree));
-        assert_eq!(refusal(script).len(), expected, "script: {script:?}");
-    }
-}
-
-fn tree_asks_for_posix(cmd: &bash_parser::Command) -> bool {
-    use bash_parser::Command as C;
-    match cmd {
-        C::Simple(s) => {
-            let is_set = s.program.as_ref().is_some_and(|p| p.text.trim_matches('"') == "set");
-            let asks = s.args.windows(2).any(|w| {
-                let flag = w[0].text.trim_matches('"');
-                flag.starts_with(['-', '+'])
-                    && flag != "--"
-                    && flag[1..].contains('o')
-                    && w[1].text.trim_matches('"') == "posix"
-            });
-            is_set && asks
-        }
-        C::Connection(c) => tree_asks_for_posix(&c.left) || tree_asks_for_posix(&c.right),
-        C::Invert(c) | C::Time(c) | C::Background(c) | C::Subshell(c) | C::Group(c) => {
-            tree_asks_for_posix(c)
-        }
-        C::Redirected { command, .. } => tree_asks_for_posix(command),
-        C::FunctionDef { body, .. } => tree_asks_for_posix(body),
-        C::For(f) => tree_asks_for_posix(&f.body),
-        C::ArithFor { body, .. } => tree_asks_for_posix(body),
-        C::While { cond, body } | C::Until { cond, body } => {
-            tree_asks_for_posix(cond) || tree_asks_for_posix(body)
-        }
-        C::If(i) => {
-            i.branches.iter().any(|(c, b)| tree_asks_for_posix(c) || tree_asks_for_posix(b))
-                || i.else_branch.as_ref().is_some_and(|b| tree_asks_for_posix(b))
-        }
-        C::Case(c) => c.arms.iter().filter_map(|a| a.body.as_ref()).any(|b| tree_asks_for_posix(b)),
-        C::Cond(_) | C::Arith { .. } => false,
+fn select_and_coproc_do_not_reach_inspection_yet() {
+    for script in ["select x in a b; do echo $x; done", "coproc cat"] {
+        assert!(
+            bash_parser::parse(script).is_err(),
+            "{script:?} parses now: wire its node into bash-inspect's tree walk"
+        );
     }
 }

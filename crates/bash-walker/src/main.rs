@@ -30,6 +30,29 @@ fn errmsg(e: &std::io::Error) -> String {
     }
 }
 
+/// The first two of the three phases, composed here rather than inside either
+/// crate: parse, then inspect. Only a tree that came back with no findings is
+/// handed to the walker, so a refused construct anywhere in the script means
+/// none of the script runs.
+///
+/// `Ok(None)` is the empty program, which is a valid one that does nothing.
+/// The `Err` carries what to print and the status to leave with.
+fn approve(src: &str, origin: &str) -> Result<Option<bash_parser::Command>, (String, i32)> {
+    if src.trim().is_empty() {
+        return Ok(None);
+    }
+    let tree = match bash_parser::parse(src) {
+        Ok(t) => t,
+        Err(e) => return Err((format!("bash-walker: syntax error: {e}\n"), 2)),
+    };
+    let findings = bash_inspect::inspect(&tree);
+    if findings.is_empty() {
+        Ok(Some(tree))
+    } else {
+        Err((bash_inspect::render(&findings, origin), 2))
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut path_state: Option<PathBuf> = std::env::var("BASH_WALKER_STATE").ok().map(PathBuf::from);
@@ -66,40 +89,6 @@ fn main() {
             .unwrap_or(1);
         println!("{width}");
         return;
-    }
-
-    // Static inspection on its own: answer whether a script can be executed,
-    // and execute none of it either way. The stage is not yet on the default
-    // path (see the crate docs), so this is how the answer is asked for.
-    if args.first().is_some_and(|a| a == "--inspect") {
-        let (origin, src) = match (args.get(1).map(String::as_str), args.get(2)) {
-            (Some("-c"), Some(script)) => ("-c".to_string(), script.clone()),
-            (Some(path), _) if !path.starts_with('-') => match std::fs::read_to_string(path) {
-                Ok(s) => (path.to_string(), s),
-                Err(e) => {
-                    eprintln!("bash-walker: {path}: {}", errmsg(&e));
-                    std::process::exit(2);
-                }
-            },
-            _ => {
-                eprintln!("bash-walker: --inspect requires a script path or -c <script>");
-                std::process::exit(2);
-            }
-        };
-        match bash_inspect::inspect(&src) {
-            Ok(_) => {
-                println!("bash-inspect: no findings. Nothing ran: inspection does not execute.");
-                return;
-            }
-            Err(bash_inspect::Refusal::Unsupported(report)) => {
-                eprint!("{}", report.render(&origin));
-                std::process::exit(1);
-            }
-            Err(bash_inspect::Refusal::Syntax(e)) => {
-                eprintln!("{origin}: syntax error: {e}");
-                std::process::exit(2);
-            }
-        }
     }
 
     // Background-job child mode: the parent hands the exact AST subtree and
@@ -158,7 +147,15 @@ fn main() {
             // SAFETY: dup(2) yields a fresh fd we own.
             unsafe { std::fs::File::from_raw_fd(libc::dup(2)) }
         };
-        let status = bash_walker::run_streaming(script, &mut state, out, err);
+        let status = match approve(script, "-c") {
+            Ok(None) => 0,
+            Ok(Some(tree)) => bash_walker::run_tree_streaming(&tree, &mut state, out, err),
+            Err((msg, status)) => {
+                use std::io::Write;
+                let _ = (&err).write_all(msg.as_bytes());
+                status
+            }
+        };
         if let Some(p) = &path_state {
             let _ = bash_walker::state::save_mode(p, &state, mode);
         }
@@ -233,7 +230,15 @@ fn main() {
                     )
                 }
             };
-            let status = bash_walker::run_streaming(&src, &mut state, out, err);
+            let status = match approve(&src, path) {
+                Ok(None) => 0,
+                Ok(Some(tree)) => bash_walker::run_tree_streaming(&tree, &mut state, out, err),
+                Err((msg, status)) => {
+                    use std::io::Write;
+                    let _ = (&err).write_all(msg.as_bytes());
+                    status
+                }
+            };
             if let Some(p) = &path_state {
                 if let Err(e) = bash_walker::state::save_mode(p, &state, mode) {
                     eprintln!("bash-walker: failed to save state: {e}");
@@ -264,7 +269,11 @@ fn main() {
         }
     };
 
-    let (output, returncode) = bash_walker::run(&command, &mut state);
+    let (output, returncode) = match approve(&command, "-c") {
+        Ok(None) => (String::new(), 0),
+        Ok(Some(tree)) => bash_walker::run_tree(&tree, &mut state),
+        Err(refusal) => refusal,
+    };
     if let Some(p) = &path_state {
         if let Err(e) = bash_walker::state::save_mode(p, &state, mode) {
             eprintln!("bash-walker: failed to save state: {e}");

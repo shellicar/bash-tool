@@ -1,11 +1,14 @@
 //! What inspection refuses, and what it owes the reader about each one.
 //!
 //! Three entries, not the whole unsupported list. The rest of that list lives
-//! inline in the walker's builtins and expander as scattered runtime refusals
-//! and is being shrunk right now; putting both sides onto one registry is
-//! separate work. These three hold still: `set -o posix` is a recorded
-//! decision (CLAUDE.md, "Declined, for now") and `select`/`coproc` are named
-//! parser refusals.
+//! inline in the walker's builtins and expander as scattered runtime refusals;
+//! putting both sides onto one registry is separate work.
+//!
+//! Only `set -o posix` is reachable today. `select` and `coproc` have no AST
+//! node, so the parser refuses them before a tree exists and nothing can hand
+//! one here. Their entries stay because the nodes are coming and this table is
+//! what names a construct and says why it will not run; every word of them was
+//! checked against bash 5.3 and re-deriving it would be waste.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Construct {
